@@ -66,4 +66,30 @@ Because Dodge AI translates Natural Language into executable raw database comman
 * **Resiliency Tools:** Pydantic (Schema Validation), Tenacity (Retries)
 * **Database Driver:** `neo4j` Python Client
 
+---
+
+## 🚀 How to Run Locally
+
+You must start both the backend FastAPI server and the frontend React server in two separate terminal windows.
+
+### 1. Start the Backend (FastAPI)
+Open a terminal and execute the following commands to initialize the Python server:
+```bash
+cd backend
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+### 2. Start the Frontend (React)
+Open a second, separate terminal window for the UI:
+```bash
+cd frontend
+npm install
+npm run build
+npm run serve:static
+```
+
+---
 *Developed proudly with Neo4j, Meta LLaMA, and Groq.*
