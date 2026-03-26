@@ -5,9 +5,15 @@
 
 <br />
 
-> **UI Snapshot**  
-> ![Dodge AI Dashboard Snapshot](https://via.placeholder.com/1200x600.png?text=Upload+Your+App+Screenshot+Here)  
-> *(Insert your favorite UI screenshot above!)*
+<div align="center">
+  <h3>Light & Dark System Aesthetics</h3>
+  <img src="assets/1_light_overview.png" width="48%" alt="Light Mode Overview" />
+  <img src="assets/2_dark_overview.png" width="48%" alt="Dark Mode Overview" />
+  
+  <h3>Contextual Agent Queries</h3>
+  <img src="assets/4_light_query.png" width="48%" alt="Light Mode Query" />
+  <img src="assets/3_dark_query.png" width="48%" alt="Dark Mode Query" />
+</div>
 
 ## 🧠 About the Project
 
