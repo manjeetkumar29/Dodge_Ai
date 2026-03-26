@@ -65,21 +65,4 @@ Because Dodge AI translates Natural Language into executable raw database comman
 * **Resiliency Tools:** Pydantic (Schema Validation), Tenacity (Retries)
 * **Database Driver:** `neo4j` Python Client
 
----
-
-## 📦 Vercel Deployment Instructions
-
-Dodge AI is split into two discrete projects (`frontend/` and `backend/`) and should be deployed natively as **two separate Vercel Projects**.
-
-### Phase 1: Deploy Backend API
-1. Import the repository into Vercel and set the Root Directory to **`backend/`**.
-2. Add all `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, and `GROQ_API_KEY` Environment Variables.
-3. Deploy. Vercel automatically reads the `vercel.json` file to deploy the FastAPI application natively as Serverless Functions. Copy the Live API URL.
-
-### Phase 2: Deploy React Frontend
-1. Import the identical repository into Vercel and set Root Directory to **`frontend/`**.
-2. Create an Environment Variable named `REACT_APP_API_URL` and paste the Live API URL you just copied from Phase 1.
-3. Deploy. The UI will automatically connect directly to your secured Serverless backend endpoints!
-
----
 *Developed proudly with Neo4j, Meta LLaMA, and Groq.*
