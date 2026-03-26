@@ -1,32 +1,47 @@
-# Dodge AI - SAP O2C Graph Intelligence
+<div align="center">
+  <h1>🚀 Dodge AI: SAP O2C Graph Intelligence</h1>
+  <p>An autonomous, self-healing Graph Database Reasoning Agent bridging Natural Language with millions of interconnected SAP Order-to-Cash operational nodes.</p>
+</div>
 
-> **UI Snapshot Placeholder**
-> ![Dodge AI Dashboard Snapshot](https://via.placeholder.com/1200x600.png?text=Upload+Your+App+Screenshot+Here)
-> *(Replace the image URL above with a real screenshot of your React Dashboard!)*
+<br />
 
-Dodge AI is an **intelligent operational assistant** that translates natural language questions into complex Cypher traversals against an extensive SAP Order-to-Cash (O2C) Neo4j Graph Database. Designed to seamlessly aggregate millions of nodes, Dodge AI empowers business analysts to directly interrogate high-volume data cycles, unearth cash-flow bottlenecks, and trace financial lifecycles at blistering speeds.
+> **UI Snapshot**  
+> ![Dodge AI Dashboard Snapshot](https://via.placeholder.com/1200x600.png?text=Upload+Your+App+Screenshot+Here)  
+> *(Insert your favorite UI screenshot above!)*
 
-## 🚀 Key Features
+## 🧠 About the Project
 
-* **Natural Language to Cypher:** Automatically constructs highly intricate, multi-path database aggregations using LLaMA models on Groq.
-* **Dynamic Graph Visualization:** Stunning responsive **D3.js** node physics engine offloaded entirely to Web Workers to ensure seamless UI threading during massive data aggregation loads.
-* **Agentic Chat Interface:** Features smart, context-aware interactive messaging capabilities including follow-up question injection and fully resizable interface panels.
-* **Intelligent Error Recovery:** Self-healing reasoning architecture that immediately intercepts Neo4j Syntax Errors and feeds them back into the LLM layer for native auto-correction.
-* **Dark Mode UI Aesthetics:** Beautiful, fully-responsive TailwindCSS layouts featuring persistent local storage configurations and granular data browser grids.
+Dodge AI fundamentally transforms how enterprise analysts query complex operational data. Instead of writing massive SQL or Cypher table-joins manually, users simply talk to the system. 
 
-## 💻 Tech Stack
+Built on top of the blistering inference speeds of **Groq** and the graph-traversal superiority of **Neo4j**, Dodge AI reads plain English context (e.g., *"Find the single most complex open-loop sales order with no billing documents"*), compiles it instantly into an AST Cypher string, executes the traversal against the backend Neo4j cluster, evaluates the mathematical result, and translates the conclusion back into a human-readable business summary.
 
-* **Graph Engine:** Neo4j (Cypher AST Generation)
-* **AI / LLM Orchestration:** LangChain, Groq API (Meta LLaMA)
-* **Backend Architecture:** Python, FastAPI, Uvicorn, Pydantic
-* **Frontend Framework:** React.js, TailwindCSS (v3), Axios
-* **Visualization:** D3.js
+### ⚡ Architectural Highlights
+1. **Self-Healing Cypher Execution:** If the LLM agent generates a flawed Cypher pattern that triggers a database `SyntaxError`, the Python orchestrator safely catches the crash, dynamically re-injects the Neo4j schema back into its prompt context window, and commands the agent to natively hot-fix the syntax error before finally returning the data to the user.
+2. **Parallel Physics Rendering:** Massive D3.js computational networking structures are safely offloaded entirely to a discrete React **Web Worker**, ensuring that the frontend browser thread never freezes or stutters even when visualizing 2,000+ localized relational edges simultaneously.
+3. **Resilient Rate Limiting Protocol:** Built natively with `tenacity`, the backend implements strict Exponential Backoff retry mechanics protecting complex analytical queries from bouncing against LLM Token Rate Limits (`429 Too Many Requests`).
 
-## ⚙️ Local Development Setup
+---
 
-### 1. Configure the Environment
+## 🛠️ Technology Stack
 
-Ensure your `backend/.env` file is properly populated with your Neo4j credentials and active `GROQ_API_KEY`:
+**Frontend Interface (`/frontend`)**
+* **Framework:** React 18, React Router DOM
+* **Styling Engine:** TailwindCSS v3 (with persistent Dark Mode contexts)
+* **Visualization:** D3.js v7 + Web Workers
+* **Networking:** Axios API interceptors
+
+**Backend Orchestrator (`/backend`)**
+* **Framework:** Python, FastAPI, Uvicorn (ASGI)
+* **AI Pipelines:** AsyncOpenAI, LangChain, LLaMA v3 on Groq
+* **Resiliency Tools:** Pydantic (Schema Validation), Tenacity (Retries)
+* **Database Driver:** `neo4j` Python Client
+
+---
+
+## 📦 Local Deployment Instructions
+
+### 1. Configure the Environment Profile
+Establish your secure credentials inside `backend/.env` for both the Graph Database cluster and your LLM inference pipeline:
 
 ```env
 NEO4J_URI=neo4j+s://<YOUR_DB>.databases.neo4j.io
@@ -36,18 +51,17 @@ GROQ_API_KEY=<YOUR_GROQ_KEY>
 GROQ_MODEL=llama-3.3-70b-versatile
 ```
 
-### 2. Boot the Application
+### 2. Boot the Global Architecture
+Dodge AI comes equipped with a universal PowerShell deployment script, isolating both the FastAPI Python runtime and the Webpack React server into parallel concurrent background jobs securely.
 
-Dodge AI comes with automated startup scripts that will natively handle running both Python (Uvicorn) and Node development servers concurrently.
-
-**Via Windows PowerShell:**
+**Automated Windows Workflow:**
 ```powershell
 .\start.ps1
 ```
 
-**Manual Start:**
+**Manual Boot Sequence:**
 
-**Backend (FastAPI):**
+**(A) Uvicorn Server Environment:**
 ```powershell
 cd backend
 python -m venv venv
@@ -56,15 +70,23 @@ pip install -r requirements.txt
 python -m uvicorn main:app --reload --port 8000
 ```
 
-**Frontend (React):**
+**(B) NPM Webpack Environment:**
 ```bash
 cd frontend
 npm install
 npm start
 ```
 
-## 🌐 Endpoints & URLs
+---
 
-* **Web UI:** `http://localhost:3000`
-* **FastAPI Core:** `http://localhost:8000`
-* **Swagger API Docs:** `http://localhost:8000/docs`
+## 📡 Core API Reference
+
+The backend exposes a highly optimized RESTful structure strictly for decoupled front-end parsing:
+
+* `POST /api/chat/message`: The primary payload sink fielding the raw string questions, returning validated synthesized responses, generated syntax lines, and arrayed analytical Node Identifiers.
+* `GET /api/graph/overview`: Broadcasts a highly-truncated, 300-node macro snapshot for immediate visual scaffolding upon initialization.
+* `GET /api/graph/search`: Maps a wildcard text query universally against any property dict spanning any structural graph node via iterative `toLower` matching.
+* `GET /api/graph/highlights/{session_id}`: Re-verifies arrayed sub-paths explicitly related to an active conversational session context.
+
+---
+*Developed proudly with Neo4j, Meta LLaMA, and Groq.*
