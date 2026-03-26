@@ -1,0 +1,5625 @@
+SAP O2C Graph Intelligence System - Complete Implementation
+Project Structure
+text
+sap-o2c-graph/
+├── backend/
+│   ├── main.py
+│   ├── config.py
+│   ├── database/
+│   │   ├── __init__.py
+│   │   ├── neo4j_client.py
+│   │   └── schema.py
+│   ├── ingestion/
+│   │   ├── __init__.py
+│   │   ├── data_loader.py
+│   │   └── graph_builder.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── graph.py
+│   │   ├── chat.py
+│   │   └── ingestion.py
+│   ├── llm/
+│   │   ├── __init__.py
+│   │   ├── agent.py
+│   │   ├── prompts.py
+│   │   └── guardrails.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   └── schemas.py
+│   └── requirements.txt
+├── frontend/
+│   ├── public/
+│   │   └── index.html
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── DataBrowser/
+│   │   │   │   ├── DataBrowser.jsx
+│   │   │   │   └── DataBrowser.css
+│   │   │   ├── GraphViewer/
+│   │   │   │   ├── GraphViewer.jsx
+│   │   │   │   └── GraphViewer.css
+│   │   │   ├── ChatPanel/
+│   │   │   │   ├── ChatPanel.jsx
+│   │   │   │   └── ChatPanel.css
+│   │   │   ├── NodeTooltip/
+│   │   │   │   ├── NodeTooltip.jsx
+│   │   │   │   └── NodeTooltip.css
+│   │   │   └── Sidebar/
+│   │   │       ├── Sidebar.jsx
+│   │   │       └── Sidebar.css
+│   │   ├── hooks/
+│   │   │   ├── useGraph.js
+│   │   │   └── useChat.js
+│   │   ├── services/
+│   │   │   └── api.js
+│   │   ├── App.jsx
+│   │   ├── App.css
+│   │   └── index.js
+│   ├── package.json
+│   └── .env
+├── data/
+│   └── sap-o2c-data/   ← place your CSV folders here
+└── docker-compose.yml
+Backend
+backend/requirements.txt
+txt
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+neo4j==5.19.0
+openai==1.30.0
+pandas==2.2.2
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-multipart==0.0.9
+httpx==0.27.0
+tenacity==8.3.0
+aiofiles==23.2.1
+backend/config.py
+python
+from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+
+class Settings(BaseSettings):
+    # Neo4j
+    NEO4J_URI: str = "bolt://localhost:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "password"
+
+    # OpenAI
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o"
+
+    # App
+    DATA_DIR: str = "./data/sap-o2c-data"
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+
+    class Config:
+        env_file = ".env"
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+backend/database/neo4j_client.py
+python
+from neo4j import AsyncGraphDatabase, AsyncDriver
+from config import get_settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+_driver: AsyncDriver | None = None
+
+
+async def get_driver() -> AsyncDriver:
+    global _driver
+    settings = get_settings()
+    if _driver is None:
+        _driver = AsyncGraphDatabase.driver(
+            settings.NEO4J_URI,
+            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+        )
+        logger.info("Neo4j driver initialized")
+    return _driver
+
+
+async def close_driver():
+    global _driver
+    if _driver:
+        await _driver.close()
+        _driver = None
+
+
+async def run_query(cypher: str, parameters: dict = None) -> list[dict]:
+    driver = await get_driver()
+    async with driver.session() as session:
+        result = await session.run(cypher, parameters or {})
+        records = await result.data()
+        return records
+
+
+async def run_write_query(cypher: str, parameters: dict = None):
+    driver = await get_driver()
+    async with driver.session() as session:
+        result = await session.run(cypher, parameters or {})
+        summary = await result.consume()
+        return summary
+backend/database/schema.py
+python
+"""
+Graph Schema for SAP Order-to-Cash
+
+Nodes:
+  - SalesOrder         (SalesOrder, SalesOrderType, SalesOrganization, ...)
+  - SalesOrderItem     (SalesOrder, SalesOrderItem, Material, ...)
+  - SalesOrderSchedule (SalesOrder, SalesOrderItem, ScheduleLine, ...)
+  - OutboundDelivery   (OutboundDelivery, ShippingPoint, ...)
+  - OutboundDeliveryItem (...)
+  - BillingDocument    (BillingDocument, BillingType, ...)
+  - BillingDocumentItem (...)
+  - BillingCancellation (...)
+  - JournalEntry       (AccountingDocument, CompanyCode, ...)
+  - Payment            (PaymentDocument, CompanyCode, ...)
+  - BusinessPartner    (BusinessPartner, BusinessPartnerFullName, ...)
+  - BusinessPartnerAddress (...)
+  - CustomerCompany    (Customer, CompanyCode, ...)
+  - CustomerSalesArea  (Customer, SalesOrganization, ...)
+  - Product            (Product, ProductType, ...)
+  - ProductDescription (Product, Language, ...)
+  - ProductPlant       (Product, Plant, ...)
+  - ProductStorageLocation (Product, Plant, StorageLocation, ...)
+  - Plant              (Plant, PlantName, ...)
+
+Relationships:
+  - (SalesOrder)-[:HAS_ITEM]->(SalesOrderItem)
+  - (SalesOrderItem)-[:HAS_SCHEDULE]->(SalesOrderSchedule)
+  - (SalesOrder)-[:SOLD_TO]->(BusinessPartner)
+  - (SalesOrderItem)-[:FOR_PRODUCT]->(Product)
+  - (OutboundDelivery)-[:FULFILLS]->(SalesOrder)
+  - (OutboundDeliveryItem)-[:PART_OF_DELIVERY]->(OutboundDelivery)
+  - (BillingDocument)-[:BILLS]->(SalesOrder)
+  - (BillingDocumentItem)-[:PART_OF_BILLING]->(BillingDocument)
+  - (BillingCancellation)-[:CANCELS]->(BillingDocument)
+  - (JournalEntry)-[:RECORDS]->(BillingDocument)
+  - (Payment)-[:SETTLES]->(BillingDocument)
+  - (BusinessPartner)-[:HAS_ADDRESS]->(BusinessPartnerAddress)
+  - (BusinessPartner)-[:HAS_COMPANY_DATA]->(CustomerCompany)
+  - (BusinessPartner)-[:HAS_SALES_AREA]->(CustomerSalesArea)
+  - (Product)-[:HAS_DESCRIPTION]->(ProductDescription)
+  - (Product)-[:STORED_AT]->(ProductPlant)
+  - (ProductPlant)-[:HAS_STORAGE]->(ProductStorageLocation)
+  - (ProductPlant)-[:IN_PLANT]->(Plant)
+"""
+
+SCHEMA_INDEXES = [
+    "CREATE INDEX sales_order_idx IF NOT EXISTS FOR (n:SalesOrder) ON (n.SalesOrder)",
+    "CREATE INDEX sales_order_item_idx IF NOT EXISTS FOR (n:SalesOrderItem) ON (n.SalesOrder, n.SalesOrderItem)",
+    "CREATE INDEX outbound_delivery_idx IF NOT EXISTS FOR (n:OutboundDelivery) ON (n.OutboundDelivery)",
+    "CREATE INDEX billing_doc_idx IF NOT EXISTS FOR (n:BillingDocument) ON (n.BillingDocument)",
+    "CREATE INDEX journal_entry_idx IF NOT EXISTS FOR (n:JournalEntry) ON (n.AccountingDocument)",
+    "CREATE INDEX payment_idx IF NOT EXISTS FOR (n:Payment) ON (n.PaymentDocument)",
+    "CREATE INDEX business_partner_idx IF NOT EXISTS FOR (n:BusinessPartner) ON (n.BusinessPartner)",
+    "CREATE INDEX product_idx IF NOT EXISTS FOR (n:Product) ON (n.Product)",
+    "CREATE INDEX plant_idx IF NOT EXISTS FOR (n:Plant) ON (n.Plant)",
+]
+
+SCHEMA_DESCRIPTION = """
+The SAP Order-to-Cash graph contains these node types:
+- SalesOrder: Main sales order header (SalesOrder ID, SalesOrderType, SoldToParty, SalesOrganization, TotalNetAmount, etc.)
+- SalesOrderItem: Line items of a sales order (Material, RequestedQuantity, NetAmount, etc.)
+- SalesOrderScheduleLine: Schedule lines for delivery (ScheduleLine, ScheduledQuantity, etc.)
+- OutboundDelivery: Delivery document header (OutboundDelivery, ShippingPoint, DeliveryDate, etc.)
+- OutboundDeliveryItem: Items within a delivery
+- BillingDocument: Invoice/billing header (BillingDocument, BillingType, BillingDate, NetAmount, etc.)
+- BillingDocumentItem: Line items on a billing document
+- BillingCancellation: Cancellation records for billing docs
+- JournalEntry: Accounting entries (AccountingDocument, CompanyCode, GlAccount, Amount, etc.)
+- Payment: AR payment records (PaymentDocument, PaymentAmount, etc.)
+- BusinessPartner: Customer/partner (BusinessPartner, BusinessPartnerFullName, etc.)
+- BusinessPartnerAddress: Address details
+- CustomerCompany: Customer's company-level data
+- CustomerSalesArea: Customer's sales area assignments
+- Product: Material/product master (Product, ProductType, BaseUnit, etc.)
+- ProductDescription: Product text descriptions
+- ProductPlant: Plant-level product data
+- ProductStorageLocation: Storage location data
+- Plant: Physical plant/warehouse
+
+Key relationships:
+- SalesOrder -[:HAS_ITEM]-> SalesOrderItem
+- SalesOrderItem -[:HAS_SCHEDULE]-> SalesOrderScheduleLine
+- SalesOrder -[:SOLD_TO]-> BusinessPartner
+- SalesOrderItem -[:FOR_PRODUCT]-> Product
+- OutboundDelivery -[:FULFILLS]-> SalesOrder
+- BillingDocument -[:BILLS]-> SalesOrder
+- JournalEntry -[:RECORDS]-> BillingDocument
+- Payment -[:SETTLES]-> BillingDocument
+- BusinessPartner -[:HAS_ADDRESS]-> BusinessPartnerAddress
+"""
+backend/ingestion/data_loader.py
+python
+import os
+import pandas as pd
+import glob
+import logging
+from config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+def load_csv_folder(folder_name: str) -> pd.DataFrame:
+    """Load all CSV/parquet files from a folder into a single DataFrame."""
+    settings = get_settings()
+    folder_path = os.path.join(settings.DATA_DIR, folder_name)
+
+    if not os.path.exists(folder_path):
+        logger.warning(f"Folder not found: {folder_path}")
+        return pd.DataFrame()
+
+    files = glob.glob(os.path.join(folder_path, "**/*.csv"), recursive=True)
+    files += glob.glob(os.path.join(folder_path, "**/*.parquet"), recursive=True)
+    files += glob.glob(os.path.join(folder_path, "*.csv"))
+    files += glob.glob(os.path.join(folder_path, "*.parquet"))
+
+    # Deduplicate
+    files = list(set(files))
+
+    if not files:
+        logger.warning(f"No CSV/parquet files in: {folder_path}")
+        return pd.DataFrame()
+
+    dfs = []
+    for f in files:
+        try:
+            if f.endswith(".parquet"):
+                df = pd.read_parquet(f)
+            else:
+                df = pd.read_csv(f, low_memory=False)
+            dfs.append(df)
+            logger.info(f"Loaded {f}: {len(df)} rows")
+        except Exception as e:
+            logger.error(f"Error loading {f}: {e}")
+
+    if not dfs:
+        return pd.DataFrame()
+
+    return pd.concat(dfs, ignore_index=True)
+
+
+def clean_row(row: dict) -> dict:
+    """Remove NaN values from row dict."""
+    return {k: (None if pd.isna(v) else v) for k, v in row.items()}
+
+
+def df_to_records(df: pd.DataFrame) -> list[dict]:
+    """Convert DataFrame to list of clean dicts."""
+    if df.empty:
+        return []
+    return [clean_row(row) for row in df.to_dict(orient="records")]
+backend/ingestion/graph_builder.py
+python
+import logging
+from database.neo4j_client import run_write_query, run_query
+from database.schema import SCHEMA_INDEXES
+from ingestion.data_loader import load_csv_folder, df_to_records
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 500
+
+
+async def initialize_schema():
+    """Create indexes."""
+    for idx_query in SCHEMA_INDEXES:
+        try:
+            await run_write_query(idx_query)
+        except Exception as e:
+            logger.warning(f"Index creation warning: {e}")
+    logger.info("Schema indexes created")
+
+
+async def _batch_upsert(label: str, id_field: str, records: list[dict]):
+    """Generic batch upsert for a node."""
+    if not records:
+        return
+    for i in range(0, len(records), BATCH_SIZE):
+        batch = records[i : i + BATCH_SIZE]
+        cypher = f"""
+        UNWIND $batch AS row
+        MERGE (n:{label} {{{id_field}: row.{id_field}}})
+        SET n += row
+        """
+        await run_write_query(cypher, {"batch": batch})
+    logger.info(f"Upserted {len(records)} {label} nodes")
+
+
+async def _batch_relate(
+    label_a: str,
+    id_a: str,
+    rel: str,
+    label_b: str,
+    id_b: str,
+    records: list[dict],
+    prop_a: str = None,
+    prop_b: str = None,
+):
+    """Create relationships in batch."""
+    if not records:
+        return
+    prop_a = prop_a or id_a
+    prop_b = prop_b or id_b
+    for i in range(0, len(records), BATCH_SIZE):
+        batch = records[i : i + BATCH_SIZE]
+        cypher = f"""
+        UNWIND $batch AS row
+        MATCH (a:{label_a} {{{id_a}: row.{prop_a}}})
+        MATCH (b:{label_b} {{{id_b}: row.{prop_b}}})
+        MERGE (a)-[:{rel}]->(b)
+        """
+        await run_write_query(cypher, {"batch": batch})
+
+
+async def load_sales_orders():
+    df = load_csv_folder("sales_order_headers")
+    records = df_to_records(df)
+    await _batch_upsert("SalesOrder", "SalesOrder", records)
+
+
+async def load_sales_order_items():
+    df = load_csv_folder("sales_order_items")
+    records = df_to_records(df)
+    await _batch_upsert("SalesOrderItem", "SalesOrderItem_Key", [
+        {**r, "SalesOrderItem_Key": f"{r.get('SalesOrder')}_{r.get('SalesOrderItem')}"} 
+        for r in records
+    ])
+    # Relate to SalesOrder
+    await _batch_relate(
+        "SalesOrder", "SalesOrder",
+        "HAS_ITEM",
+        "SalesOrderItem", "SalesOrderItem_Key",
+        [{"SalesOrder": r.get("SalesOrder"),
+          "SalesOrderItem_Key": f"{r.get('SalesOrder')}_{r.get('SalesOrderItem')}"}
+         for r in records if r.get("SalesOrder")]
+    )
+
+
+async def load_sales_order_schedules():
+    df = load_csv_folder("sales_order_schedule_lines")
+    records = df_to_records(df)
+    await _batch_upsert("SalesOrderScheduleLine", "SalesOrderScheduleLine_Key", [
+        {**r, "SalesOrderScheduleLine_Key": f"{r.get('SalesOrder')}_{r.get('SalesOrderItem')}_{r.get('ScheduleLine', '')}"}
+        for r in records
+    ])
+    # Relate to SalesOrderItem
+    for r in records:
+        r["SalesOrderItem_Key"] = f"{r.get('SalesOrder')}_{r.get('SalesOrderItem')}"
+        r["SalesOrderScheduleLine_Key"] = f"{r.get('SalesOrder')}_{r.get('SalesOrderItem')}_{r.get('ScheduleLine', '')}"
+    await _batch_relate(
+        "SalesOrderItem", "SalesOrderItem_Key",
+        "HAS_SCHEDULE",
+        "SalesOrderScheduleLine", "SalesOrderScheduleLine_Key",
+        records
+    )
+
+
+async def load_outbound_deliveries():
+    df = load_csv_folder("outbound_delivery_headers")
+    records = df_to_records(df)
+    await _batch_upsert("OutboundDelivery", "OutboundDelivery", records)
+    # Relate to SalesOrder via ReferenceDocument or similar
+    so_records = [r for r in records if r.get("SalesOrder") or r.get("ReferenceSDDocument")]
+    for r in so_records:
+        r["_SalesOrder"] = r.get("SalesOrder") or r.get("ReferenceSDDocument")
+    if so_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (d:OutboundDelivery {OutboundDelivery: row.OutboundDelivery})
+        MATCH (s:SalesOrder {SalesOrder: row._SalesOrder})
+        MERGE (d)-[:FULFILLS]->(s)
+        """
+        for i in range(0, len(so_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": so_records[i:i+BATCH_SIZE]})
+
+
+async def load_outbound_delivery_items():
+    df = load_csv_folder("outbound_delivery_items")
+    records = df_to_records(df)
+    await _batch_upsert("OutboundDeliveryItem", "OutboundDeliveryItem_Key", [
+        {**r, "OutboundDeliveryItem_Key": f"{r.get('OutboundDelivery')}_{r.get('DeliveryItem', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["OutboundDeliveryItem_Key"] = f"{r.get('OutboundDelivery')}_{r.get('DeliveryItem', '')}"
+    await _batch_relate(
+        "OutboundDeliveryItem", "OutboundDeliveryItem_Key",
+        "PART_OF_DELIVERY",
+        "OutboundDelivery", "OutboundDelivery",
+        records
+    )
+
+
+async def load_billing_documents():
+    df = load_csv_folder("billing_document_headers")
+    records = df_to_records(df)
+    await _batch_upsert("BillingDocument", "BillingDocument", records)
+    # Relate to SalesOrder
+    so_records = [r for r in records if r.get("ReferenceDocument") or r.get("SalesDocument")]
+    for r in so_records:
+        r["_SalesOrder"] = r.get("SalesDocument") or r.get("ReferenceDocument")
+    if so_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (b:BillingDocument {BillingDocument: row.BillingDocument})
+        MATCH (s:SalesOrder {SalesOrder: row._SalesOrder})
+        MERGE (b)-[:BILLS]->(s)
+        """
+        for i in range(0, len(so_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": so_records[i:i+BATCH_SIZE]})
+
+
+async def load_billing_document_items():
+    df = load_csv_folder("billing_document_items")
+    records = df_to_records(df)
+    await _batch_upsert("BillingDocumentItem", "BillingDocumentItem_Key", [
+        {**r, "BillingDocumentItem_Key": f"{r.get('BillingDocument')}_{r.get('BillingDocumentItem', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["BillingDocumentItem_Key"] = f"{r.get('BillingDocument')}_{r.get('BillingDocumentItem', '')}"
+    await _batch_relate(
+        "BillingDocumentItem", "BillingDocumentItem_Key",
+        "PART_OF_BILLING",
+        "BillingDocument", "BillingDocument",
+        records
+    )
+
+
+async def load_billing_cancellations():
+    df = load_csv_folder("billing_document_cancellations")
+    records = df_to_records(df)
+    await _batch_upsert("BillingCancellation", "CancelledBillingDocument", records)
+    cancel_records = [r for r in records if r.get("CancelledBillingDocument")]
+    if cancel_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (c:BillingCancellation {CancelledBillingDocument: row.CancelledBillingDocument})
+        MATCH (b:BillingDocument {BillingDocument: row.CancelledBillingDocument})
+        MERGE (c)-[:CANCELS]->(b)
+        """
+        for i in range(0, len(cancel_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": cancel_records[i:i+BATCH_SIZE]})
+
+
+async def load_journal_entries():
+    df = load_csv_folder("journal_entry_items_accounts_receivable")
+    records = df_to_records(df)
+    await _batch_upsert("JournalEntry", "JournalEntry_Key", [
+        {**r, "JournalEntry_Key": f"{r.get('AccountingDocument')}_{r.get('AccountingDocumentItem', '')}_{r.get('CompanyCode', '')}"}
+        for r in records
+    ])
+    # Relate to BillingDocument via ReferenceDocument
+    ref_records = [r for r in records if r.get("ReferenceDocument")]
+    for r in ref_records:
+        r["JournalEntry_Key"] = f"{r.get('AccountingDocument')}_{r.get('AccountingDocumentItem', '')}_{r.get('CompanyCode', '')}"
+        r["_BillingDocument"] = r.get("ReferenceDocument")
+    if ref_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (j:JournalEntry {JournalEntry_Key: row.JournalEntry_Key})
+        MATCH (b:BillingDocument {BillingDocument: row._BillingDocument})
+        MERGE (j)-[:RECORDS]->(b)
+        """
+        for i in range(0, len(ref_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": ref_records[i:i+BATCH_SIZE]})
+
+
+async def load_payments():
+    df = load_csv_folder("payments_accounts_receivable")
+    records = df_to_records(df)
+    await _batch_upsert("Payment", "Payment_Key", [
+        {**r, "Payment_Key": f"{r.get('PaymentDocument', r.get('AccountingDocument', ''))}_{r.get('CompanyCode', '')}"}
+        for r in records
+    ])
+    # Relate to BillingDocument via ClearingDocument or reference
+    ref_records = [r for r in records if r.get("ClearingDocument") or r.get("ReferenceDocument")]
+    for r in ref_records:
+        r["Payment_Key"] = f"{r.get('PaymentDocument', r.get('AccountingDocument', ''))}_{r.get('CompanyCode', '')}"
+        r["_BillingDocument"] = r.get("ClearingDocument") or r.get("ReferenceDocument")
+    if ref_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (p:Payment {Payment_Key: row.Payment_Key})
+        MATCH (b:BillingDocument {BillingDocument: row._BillingDocument})
+        MERGE (p)-[:SETTLES]->(b)
+        """
+        for i in range(0, len(ref_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": ref_records[i:i+BATCH_SIZE]})
+
+
+async def load_business_partners():
+    df = load_csv_folder("business_partners")
+    records = df_to_records(df)
+    await _batch_upsert("BusinessPartner", "BusinessPartner", records)
+
+
+async def load_business_partner_addresses():
+    df = load_csv_folder("business_partner_addresses")
+    records = df_to_records(df)
+    await _batch_upsert("BusinessPartnerAddress", "BusinessPartnerAddress_Key", [
+        {**r, "BusinessPartnerAddress_Key": f"{r.get('BusinessPartner')}_{r.get('AddressID', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["BusinessPartnerAddress_Key"] = f"{r.get('BusinessPartner')}_{r.get('AddressID', '')}"
+    await _batch_relate(
+        "BusinessPartner", "BusinessPartner",
+        "HAS_ADDRESS",
+        "BusinessPartnerAddress", "BusinessPartnerAddress_Key",
+        records
+    )
+
+
+async def load_customer_company():
+    df = load_csv_folder("customer_company_assignments")
+    records = df_to_records(df)
+    await _batch_upsert("CustomerCompany", "CustomerCompany_Key", [
+        {**r, "CustomerCompany_Key": f"{r.get('Customer')}_{r.get('CompanyCode', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["CustomerCompany_Key"] = f"{r.get('Customer')}_{r.get('CompanyCode', '')}"
+        r["_BusinessPartner"] = r.get("Customer") or r.get("BusinessPartner")
+    bp_records = [r for r in records if r.get("_BusinessPartner")]
+    if bp_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (bp:BusinessPartner {BusinessPartner: row._BusinessPartner})
+        MATCH (cc:CustomerCompany {CustomerCompany_Key: row.CustomerCompany_Key})
+        MERGE (bp)-[:HAS_COMPANY_DATA]->(cc)
+        """
+        for i in range(0, len(bp_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": bp_records[i:i+BATCH_SIZE]})
+
+
+async def load_customer_sales_area():
+    df = load_csv_folder("customer_sales_area_assignments")
+    records = df_to_records(df)
+    await _batch_upsert("CustomerSalesArea", "CustomerSalesArea_Key", [
+        {**r, "CustomerSalesArea_Key": f"{r.get('Customer')}_{r.get('SalesOrganization', '')}_{r.get('DistributionChannel', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["CustomerSalesArea_Key"] = f"{r.get('Customer')}_{r.get('SalesOrganization', '')}_{r.get('DistributionChannel', '')}"
+        r["_BusinessPartner"] = r.get("Customer") or r.get("BusinessPartner")
+    bp_records = [r for r in records if r.get("_BusinessPartner")]
+    if bp_records:
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (bp:BusinessPartner {BusinessPartner: row._BusinessPartner})
+        MATCH (csa:CustomerSalesArea {CustomerSalesArea_Key: row.CustomerSalesArea_Key})
+        MERGE (bp)-[:HAS_SALES_AREA]->(csa)
+        """
+        for i in range(0, len(bp_records), BATCH_SIZE):
+            await run_write_query(cypher, {"batch": bp_records[i:i+BATCH_SIZE]})
+
+
+async def load_products():
+    df = load_csv_folder("products")
+    records = df_to_records(df)
+    await _batch_upsert("Product", "Product", records)
+
+    # Relate SalesOrderItem to Product
+    cypher = """
+    MATCH (i:SalesOrderItem)
+    WHERE i.Material IS NOT NULL
+    MATCH (p:Product {Product: i.Material})
+    MERGE (i)-[:FOR_PRODUCT]->(p)
+    """
+    await run_write_query(cypher)
+
+
+async def load_product_descriptions():
+    df = load_csv_folder("product_descriptions")
+    records = df_to_records(df)
+    await _batch_upsert("ProductDescription", "ProductDescription_Key", [
+        {**r, "ProductDescription_Key": f"{r.get('Product')}_{r.get('Language', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["ProductDescription_Key"] = f"{r.get('Product')}_{r.get('Language', '')}"
+    await _batch_relate(
+        "Product", "Product",
+        "HAS_DESCRIPTION",
+        "ProductDescription", "ProductDescription_Key",
+        records
+    )
+
+
+async def load_plants():
+    df = load_csv_folder("plants")
+    records = df_to_records(df)
+    await _batch_upsert("Plant", "Plant", records)
+
+
+async def load_product_plants():
+    df = load_csv_folder("product_plants")
+    records = df_to_records(df)
+    await _batch_upsert("ProductPlant", "ProductPlant_Key", [
+        {**r, "ProductPlant_Key": f"{r.get('Product')}_{r.get('Plant', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["ProductPlant_Key"] = f"{r.get('Product')}_{r.get('Plant', '')}"
+    await _batch_relate(
+        "Product", "Product",
+        "STORED_AT",
+        "ProductPlant", "ProductPlant_Key",
+        records
+    )
+    await _batch_relate(
+        "ProductPlant", "ProductPlant_Key",
+        "IN_PLANT",
+        "Plant", "Plant",
+        records
+    )
+
+
+async def load_product_storage_locations():
+    df = load_csv_folder("product_storage_locations")
+    records = df_to_records(df)
+    await _batch_upsert("ProductStorageLocation", "ProductStorageLocation_Key", [
+        {**r, "ProductStorageLocation_Key": f"{r.get('Product')}_{r.get('Plant', '')}_{r.get('StorageLocation', '')}"}
+        for r in records
+    ])
+    for r in records:
+        r["ProductStorageLocation_Key"] = f"{r.get('Product')}_{r.get('Plant', '')}_{r.get('StorageLocation', '')}"
+        r["ProductPlant_Key"] = f"{r.get('Product')}_{r.get('Plant', '')}"
+    await _batch_relate(
+        "ProductPlant", "ProductPlant_Key",
+        "HAS_STORAGE",
+        "ProductStorageLocation", "ProductStorageLocation_Key",
+        records
+    )
+
+
+async def link_sales_orders_to_partners():
+    """Link SalesOrders to BusinessPartners after both are loaded."""
+    cypher = """
+    MATCH (s:SalesOrder)
+    WHERE s.SoldToParty IS NOT NULL
+    MATCH (bp:BusinessPartner {BusinessPartner: s.SoldToParty})
+    MERGE (s)-[:SOLD_TO]->(bp)
+    """
+    await run_write_query(cypher)
+
+
+async def run_full_ingestion():
+    """Run the complete data ingestion pipeline."""
+    logger.info("Starting full ingestion...")
+    await initialize_schema()
+
+    loaders = [
+        ("Sales Orders", load_sales_orders),
+        ("Sales Order Items", load_sales_order_items),
+        ("Sales Order Schedules", load_sales_order_schedules),
+        ("Business Partners", load_business_partners),
+        ("Business Partner Addresses", load_business_partner_addresses),
+        ("Customer Company", load_customer_company),
+        ("Customer Sales Area", load_customer_sales_area),
+        ("Plants", load_plants),
+        ("Products", load_products),
+        ("Product Descriptions", load_product_descriptions),
+        ("Product Plants", load_product_plants),
+        ("Product Storage Locations", load_product_storage_locations),
+        ("Outbound Deliveries", load_outbound_deliveries),
+        ("Outbound Delivery Items", load_outbound_delivery_items),
+        ("Billing Documents", load_billing_documents),
+        ("Billing Document Items", load_billing_document_items),
+        ("Billing Cancellations", load_billing_cancellations),
+        ("Journal Entries", load_journal_entries),
+        ("Payments", load_payments),
+        ("Link Sales Orders to Partners", link_sales_orders_to_partners),
+    ]
+
+    results = []
+    for name, loader in loaders:
+        try:
+            logger.info(f"Loading: {name}")
+            await loader()
+            results.append({"step": name, "status": "success"})
+        except Exception as e:
+            logger.error(f"Error in {name}: {e}")
+            results.append({"step": name, "status": "error", "error": str(e)})
+
+    logger.info("Ingestion complete")
+    return results
+backend/llm/prompts.py
+python
+from database.schema import SCHEMA_DESCRIPTION
+
+SYSTEM_PROMPT = f"""You are Dodge AI, an expert Graph Agent for analyzing SAP Order-to-Cash (O2C) processes.
+You have access to a Neo4j graph database containing the complete SAP O2C data.
+
+{SCHEMA_DESCRIPTION}
+
+Your capabilities:
+1. Translate natural language questions into Cypher queries
+2. Execute queries and interpret results
+3. Highlight relevant nodes in the graph visualization
+4. Explain O2C business processes
+
+Rules:
+- ONLY answer questions related to the SAP O2C data and business processes
+- If asked about unrelated topics, politely redirect to O2C topics
+- Always explain your findings in business terms, not just raw data
+- When referencing document numbers, format them clearly
+- If a query returns no results, suggest alternatives
+- Always generate valid Cypher for Neo4j 5.x
+
+Output format for queries:
+Return a JSON object with:
+{{
+  "cypher": "the cypher query",
+  "explanation": "what this query does",
+  "answer": "the business answer after execution"
+}}
+"""
+
+CYPHER_GENERATION_PROMPT = """Given this user question about the SAP O2C graph:
+
+Question: {question}
+
+Generate a Cypher query to answer it. The query should:
+1. Be valid Neo4j 5.x Cypher
+2. Use LIMIT 100 unless the user asks for all records  
+3. Return meaningful properties
+4. Use case-insensitive matching where appropriate
+
+Schema context:
+{schema}
+
+Return ONLY valid JSON in this format:
+{{
+  "cypher": "MATCH ...",
+  "explanation": "This query finds..."
+}}
+"""
+
+ANSWER_GENERATION_PROMPT = """The user asked: {question}
+
+I ran this Cypher query: {cypher}
+
+The query returned {count} results. Here are the results:
+{results}
+
+Please provide:
+1. A clear, concise business answer
+2. Key insights from the data
+3. Any notable patterns or anomalies
+4. If relevant, suggest follow-up questions
+
+Keep the answer focused on the O2C business context.
+"""
+
+HIGHLIGHT_PROMPT = """Based on this query result, which node IDs should be highlighted in the graph?
+Return a JSON array of node labels and IDs that are most relevant to the answer.
+Format: [{{"label": "BillingDocument", "id": "90001234"}}]
+
+Query: {cypher}
+Results: {results}
+"""
+backend/llm/guardrails.py
+python
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Topics that are allowed
+ALLOWED_TOPICS = [
+    "order", "sales", "billing", "invoice", "payment", "delivery",
+    "shipment", "product", "material", "customer", "partner", "plant",
+    "journal", "accounting", "revenue", "o2c", "sap", "erp",
+    "document", "schedule", "cancellation", "storage", "warehouse",
+    "quantity", "amount", "currency", "company", "organization",
+    "analyze", "show", "find", "list", "count", "total", "sum",
+    "which", "what", "how", "when", "where", "who",
+    "graph", "node", "relationship", "connected", "linked",
+    "cash", "receivable", "ledger", "entry",
+]
+
+# Blocked patterns
+BLOCKED_PATTERNS = [
+    r"\b(password|secret|api.?key|token|credential)\b",
+    r"\b(hack|exploit|injection|drop\s+table|delete\s+all)\b",
+    r"\b(personal\s+info|social\s+security|credit\s+card)\b",
+    r"(ignore\s+previous|forget\s+instructions|jailbreak|dan\s+mode)",
+    r"\b(weather|recipe|joke|movie|sport|news|politics|religion)\b",
+    r"\b(write\s+code|generate\s+script|create\s+program)\b(?!.*cypher)",
+]
+
+CYPHER_DANGEROUS_PATTERNS = [
+    r"\bDELETE\b",
+    r"\bDETACH\s+DELETE\b",
+    r"\bDROP\b",
+    r"\bCREATE\s+USER\b",
+    r"\bCREATE\s+DATABASE\b",
+    r"\bSET\s+PASSWORD\b",
+    r"\bCALL\s+dbms\b",
+    r"\bCALL\s+apoc\.periodic\.commit\b",
+]
+
+
+def check_message_safety(message: str) -> tuple[bool, str]:
+    """
+    Returns (is_safe, reason_if_not_safe)
+    """
+    msg_lower = message.lower()
+
+    # Check blocked patterns
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, msg_lower, re.IGNORECASE):
+            return False, "I can only help with SAP Order-to-Cash data analysis. Please ask about orders, billing, deliveries, or other O2C topics."
+
+    # Check if message has any O2C relevance (for non-trivial messages)
+    words = msg_lower.split()
+    if len(words) > 5:
+        has_relevant = any(
+            any(topic in word for topic in ALLOWED_TOPICS)
+            for word in words
+        )
+        if not has_relevant:
+            return False, "I'm specialized in SAP Order-to-Cash analysis. Please ask me about sales orders, billing documents, deliveries, payments, or related O2C topics."
+
+    return True, ""
+
+
+def validate_cypher_query(cypher: str) -> tuple[bool, str]:
+    """
+    Validate that a generated Cypher query is safe to execute.
+    Returns (is_safe, reason_if_not_safe)
+    """
+    for pattern in CYPHER_DANGEROUS_PATTERNS:
+        if re.search(pattern, cypher, re.IGNORECASE):
+            return False, f"Generated query contains unsafe operation: {pattern}"
+
+    # Must be a read query or safe write
+    if not re.search(r"\b(MATCH|RETURN|WITH|CALL|UNWIND)\b", cypher, re.IGNORECASE):
+        return False, "Query does not appear to be a valid read query"
+
+    return True, ""
+
+
+def sanitize_cypher_limit(cypher: str, max_limit: int = 500) -> str:
+    """Ensure query doesn't return too many records."""
+    if not re.search(r"\bLIMIT\s+\d+", cypher, re.IGNORECASE):
+        # Add limit before any ORDER BY at the end, or just at the end
+        cypher = cypher.rstrip().rstrip(";")
+        cypher += f" LIMIT {max_limit}"
+    return cypher
+backend/llm/agent.py
+python
+import json
+import logging
+import re
+from openai import AsyncOpenAI
+from config import get_settings
+from database.neo4j_client import run_query
+from database.schema import SCHEMA_DESCRIPTION
+from llm.prompts import SYSTEM_PROMPT, CYPHER_GENERATION_PROMPT, ANSWER_GENERATION_PROMPT
+from llm.guardrails import check_message_safety, validate_cypher_query, sanitize_cypher_limit
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+logger = logging.getLogger(__name__)
+
+
+class GraphAgent:
+    def __init__(self):
+        settings = get_settings()
+        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.model = settings.OPENAI_MODEL
+        self.conversation_history = []
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def _call_llm(self, messages: list[dict], response_format: str = "text") -> str:
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+        }
+        if response_format == "json":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = await self.client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content
+
+    async def _generate_cypher(self, question: str) -> dict:
+        """Generate a Cypher query from a natural language question."""
+        prompt = CYPHER_GENERATION_PROMPT.format(
+            question=question,
+            schema=SCHEMA_DESCRIPTION
+        )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+        raw = await self._call_llm(messages, response_format="json")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Try to extract JSON from response
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            return {"cypher": None, "explanation": "Failed to generate query"}
+
+    async def _execute_cypher(self, cypher: str) -> list[dict]:
+        """Safely execute a Cypher query."""
+        is_safe, reason = validate_cypher_query(cypher)
+        if not is_safe:
+            logger.warning(f"Unsafe Cypher blocked: {reason}")
+            return []
+
+        cypher = sanitize_cypher_limit(cypher)
+
+        try:
+            results = await run_query(cypher)
+            return results
+        except Exception as e:
+            logger.error(f"Cypher execution error: {e}")
+            raise
+
+    async def _generate_answer(
+        self,
+        question: str,
+        cypher: str,
+        results: list[dict]
+    ) -> str:
+        """Generate a natural language answer from query results."""
+        # Truncate results for prompt
+        results_preview = results[:20] if len(results) > 20 else results
+        results_str = json.dumps(results_preview, indent=2, default=str)
+
+        prompt = ANSWER_GENERATION_PROMPT.format(
+            question=question,
+            cypher=cypher,
+            count=len(results),
+            results=results_str
+        )
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *self.conversation_history[-6:],  # Keep last 3 exchanges
+            {"role": "user", "content": prompt}
+        ]
+
+        return await self._call_llm(messages)
+
+    async def _extract_highlight_ids(self, results: list[dict]) -> list[dict]:
+        """Extract node IDs from results for graph highlighting."""
+        highlights = []
+        for record in results[:50]:
+            for key, val in record.items():
+                if isinstance(val, dict):
+                    # Neo4j node
+                    labels = val.get("labels", [])
+                    props = val.get("properties", {})
+                    if labels and props:
+                        highlights.append({
+                            "label": labels[0],
+                            "properties": props
+                        })
+        return highlights
+
+    async def chat(self, message: str, session_id: str = "default") -> dict:
+        """
+        Main chat entry point.
+        Returns: {answer, cypher, results, highlights, error}
+        """
+        # Guardrail check
+        is_safe, reason = check_message_safety(message)
+        if not is_safe:
+            return {
+                "answer": reason,
+                "cypher": None,
+                "results": [],
+                "highlights": [],
+                "error": None
+            }
+
+        try:
+            # Generate Cypher
+            cypher_result = await self._generate_cypher(message)
+            cypher = cypher_result.get("cypher")
+            explanation = cypher_result.get("explanation", "")
+
+            results = []
+            answer = ""
+
+            if cypher:
+                # Execute query
+                try:
+                    results = await self._execute_cypher(cypher)
+                except Exception as e:
+                    # Try to fix query
+                    logger.error(f"Query failed, attempting fix: {e}")
+                    fix_messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": f"This Cypher query failed with error '{e}'. Fix it:\n{cypher}\nReturn only the fixed query as JSON: {{\"cypher\": \"...\"}}"}
+                    ]
+                    fix_raw = await self._call_llm(fix_messages, response_format="json")
+                    fix_data = json.loads(fix_raw)
+                    fixed_cypher = fix_data.get("cypher", cypher)
+                    results = await self._execute_cypher(fixed_cypher)
+                    cypher = fixed_cypher
+
+                # Generate answer
+                answer = await self._generate_answer(message, cypher, results)
+            else:
+                # Direct conversational response
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    *self.conversation_history[-6:],
+                    {"role": "user", "content": message}
+                ]
+                answer = await self._call_llm(messages)
+
+            # Update conversation history
+            self.conversation_history.append({"role": "user", "content": message})
+            self.conversation_history.append({"role": "assistant", "content": answer})
+
+            # Extract highlights
+            highlights = await self._extract_highlight_ids(results)
+
+            return {
+                "answer": answer,
+                "cypher": cypher,
+                "results": results[:100],
+                "highlights": highlights,
+                "error": None
+            }
+
+        except Exception as e:
+            logger.error(f"Agent error: {e}", exc_info=True)
+            return {
+                "answer": "I encountered an error processing your request. Please try again.",
+                "cypher": None,
+                "results": [],
+                "highlights": [],
+                "error": str(e)
+            }
+
+
+# Session-based agents
+_agents: dict[str, GraphAgent] = {}
+
+
+def get_agent(session_id: str = "default") -> GraphAgent:
+    if session_id not in _agents:
+        _agents[session_id] = GraphAgent()
+    return _agents[session_id]
+backend/models/schemas.py
+python
+from pydantic import BaseModel, Field
+from typing import Optional, Any
+from datetime import datetime
+
+
+class ChatMessage(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    session_id: str = Field(default="default")
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    cypher: Optional[str] = None
+    results: list[dict] = []
+    highlights: list[dict] = []
+    error: Optional[str] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class GraphNode(BaseModel):
+    id: str
+    label: str
+    properties: dict[str, Any]
+    connections: int = 0
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    type: str
+
+
+class GraphData(BaseModel):
+    nodes: list[dict]
+    edges: list[dict]
+    node_count: int
+    edge_count: int
+
+
+class IngestionStatus(BaseModel):
+    status: str
+    steps: list[dict] = []
+    message: str = ""
+
+
+class NodeSearchResult(BaseModel):
+    nodes: list[dict]
+    total: int
+backend/api/graph.py
+python
+from fastapi import APIRouter, Query, HTTPException
+from database.neo4j_client import run_query
+from models.schemas import GraphData, NodeSearchResult
+import logging
+
+router = APIRouter(prefix="/api/graph", tags=["graph"])
+logger = logging.getLogger(__name__)
+
+
+@router.get("/overview", response_model=GraphData)
+async def get_graph_overview(
+    limit: int = Query(default=300, le=1000),
+    node_types: str = Query(default=None)
+):
+    """Get graph overview for visualization."""
+    if node_types:
+        labels = [l.strip() for l in node_types.split(",")]
+        label_filter = "|".join(labels)
+        node_query = f"""
+        MATCH (n:{label_filter})
+        WITH n LIMIT {limit}
+        RETURN 
+            id(n) AS id,
+            labels(n) AS labels,
+            properties(n) AS props
+        """
+    else:
+        node_query = f"""
+        MATCH (n)
+        WHERE n:{' OR n:'.join([
+            'SalesOrder', 'BillingDocument', 'OutboundDelivery',
+            'BusinessPartner', 'JournalEntry', 'Payment', 'Product'
+        ])}
+        WITH n LIMIT {limit}
+        RETURN 
+            id(n) AS id,
+            labels(n) AS labels,
+            properties(n) AS props
+        """
+
+    nodes_raw = await run_query(node_query)
+
+    # Get edges between these nodes
+    node_ids = [r["id"] for r in nodes_raw]
+    if node_ids:
+        edge_query = """
+        MATCH (a)-[r]->(b)
+        WHERE id(a) IN $ids AND id(b) IN $ids
+        RETURN 
+            id(a) AS source,
+            id(b) AS target,
+            type(r) AS rel_type
+        LIMIT 2000
+        """
+        edges_raw = await run_query(edge_query, {"ids": node_ids})
+    else:
+        edges_raw = []
+
+    # Format nodes
+    nodes = []
+    for r in nodes_raw:
+        props = r.get("props", {})
+        label = r.get("labels", ["Unknown"])[0]
+        # Get display name
+        display_id = (
+            props.get("SalesOrder") or
+            props.get("BillingDocument") or
+            props.get("OutboundDelivery") or
+            props.get("BusinessPartner") or
+            props.get("AccountingDocument") or
+            props.get("Product") or
+            props.get("Plant") or
+            str(r["id"])
+        )
+        nodes.append({
+            "id": str(r["id"]),
+            "label": label,
+            "display_id": str(display_id),
+            "properties": {k: str(v) if v is not None else None for k, v in props.items()},
+        })
+
+    edges = [
+        {
+            "source": str(e["source"]),
+            "target": str(e["target"]),
+            "type": e["rel_type"]
+        }
+        for e in edges_raw
+    ]
+
+    return GraphData(
+        nodes=nodes,
+        edges=edges,
+        node_count=len(nodes),
+        edge_count=len(edges)
+    )
+
+
+@router.get("/node/{node_id}")
+async def get_node_detail(node_id: int):
+    """Get detailed info about a specific node."""
+    query = """
+    MATCH (n)
+    WHERE id(n) = $node_id
+    OPTIONAL MATCH (n)-[r]-(neighbor)
+    RETURN 
+        labels(n) AS labels,
+        properties(n) AS props,
+        count(r) AS connection_count,
+        collect(DISTINCT {
+            type: type(r),
+            neighbor_label: labels(neighbor)[0],
+            neighbor_props: properties(neighbor)
+        })[..10] AS connections
+    """
+    results = await run_query(query, {"node_id": node_id})
+    if not results:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return results[0]
+
+
+@router.get("/search", response_model=NodeSearchResult)
+async def search_nodes(
+    q: str = Query(..., min_length=1),
+    label: str = Query(default=None),
+    limit: int = Query(default=20, le=100)
+):
+    """Search nodes by property values."""
+    if label:
+        query = f"""
+        MATCH (n:{label})
+        WHERE any(prop IN keys(n) WHERE toLower(toString(n[prop])) CONTAINS toLower($q))
+        RETURN id(n) AS id, labels(n) AS labels, properties(n) AS props
+        LIMIT $limit
+        """
+    else:
+        query = """
+        MATCH (n)
+        WHERE any(prop IN keys(n) WHERE toLower(toString(n[prop])) CONTAINS toLower($q))
+        RETURN id(n) AS id, labels(n) AS labels, properties(n) AS props
+        LIMIT $limit
+        """
+    results = await run_query(query, {"q": q, "limit": limit})
+    nodes = [
+        {"id": str(r["id"]), "label": r["labels"][0] if r["labels"] else "Unknown", "properties": r["props"]}
+        for r in results
+    ]
+    return NodeSearchResult(nodes=nodes, total=len(nodes))
+
+
+@router.get("/stats")
+async def get_graph_stats():
+    """Get overall graph statistics."""
+    query = """
+    CALL apoc.meta.stats()
+    YIELD labels, relTypesCount, nodeCount, relCount
+    RETURN labels, relTypesCount, nodeCount, relCount
+    """
+    try:
+        results = await run_query(query)
+        return results[0] if results else {}
+    except Exception:
+        # Fallback without APOC
+        query = """
+        MATCH (n)
+        RETURN labels(n)[0] AS label, count(n) AS count
+        ORDER BY count DESC
+        """
+        node_counts = await run_query(query)
+
+        rel_query = """
+        MATCH ()-[r]->()
+        RETURN type(r) AS type, count(r) AS count
+        ORDER BY count DESC
+        """
+        rel_counts = await run_query(rel_query)
+
+        return {
+            "node_counts": node_counts,
+            "relationship_counts": rel_counts,
+        }
+
+
+@router.get("/highlights/{session_id}")
+async def get_highlighted_nodes(session_id: str, node_ids: str = Query(...)):
+    """Get subgraph for highlighted nodes."""
+    ids = [int(i) for i in node_ids.split(",") if i.isdigit()]
+    if not ids:
+        return {"nodes": [], "edges": []}
+
+    query = """
+    MATCH (n)
+    WHERE id(n) IN $ids
+    OPTIONAL MATCH (n)-[r]-(m)
+    WHERE id(m) IN $ids
+    RETURN 
+        id(n) AS id, labels(n) AS labels, properties(n) AS props,
+        id(startNode(r)) AS src, id(endNode(r)) AS tgt, type(r) AS rel_type
+    """
+    results = await run_query(query, {"ids": ids})
+    return results
+backend/api/chat.py
+python
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from models.schemas import ChatMessage, ChatResponse
+from llm.agent import get_agent
+import json
+import logging
+
+router = APIRouter(prefix="/api/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
+
+
+@router.post("/message", response_model=ChatResponse)
+async def send_message(payload: ChatMessage):
+    """Send a message to the Graph Agent."""
+    if not payload.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    agent = get_agent(payload.session_id)
+    result = await agent.chat(payload.message, payload.session_id)
+    return ChatResponse(**result)
+
+
+@router.delete("/session/{session_id}")
+async def clear_session(session_id: str):
+    """Clear conversation history for a session."""
+    from llm.agent import _agents
+    if session_id in _agents:
+        del _agents[session_id]
+    return {"message": "Session cleared"}
+
+
+@router.get("/history/{session_id}")
+async def get_history(session_id: str):
+    """Get conversation history."""
+    from llm.agent import _agents
+    agent = _agents.get(session_id)
+    if not agent:
+        return {"history": []}
+    return {"history": agent.conversation_history}
+backend/api/ingestion.py
+python
+from fastapi import APIRouter, BackgroundTasks
+from ingestion.graph_builder import run_full_ingestion
+from models.schemas import IngestionStatus
+import asyncio
+import logging
+
+router = APIRouter(prefix="/api/ingestion", tags=["ingestion"])
+logger = logging.getLogger(__name__)
+
+_ingestion_status = {"running": False, "results
+Claude Sonnet 4.6
+continue complete it fully
+
+
+Thought Process
+expand
+I'll continue from where it left off and complete every remaining file.
+
+backend/api/ingestion.py (complete)
+python
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from ingestion.graph_builder import run_full_ingestion
+from models.schemas import IngestionStatus
+import logging
+
+router = APIRouter(prefix="/api/ingestion", tags=["ingestion"])
+logger = logging.getLogger(__name__)
+
+_ingestion_status: dict = {
+    "running": False,
+    "results": [],
+    "error": None,
+    "completed": False,
+}
+
+
+async def _run_ingestion_task():
+    global _ingestion_status
+    _ingestion_status["running"] = True
+    _ingestion_status["completed"] = False
+    _ingestion_status["error"] = None
+    _ingestion_status["results"] = []
+    try:
+        results = await run_full_ingestion()
+        _ingestion_status["results"] = results
+        _ingestion_status["completed"] = True
+    except Exception as e:
+        logger.error(f"Ingestion failed: {e}", exc_info=True)
+        _ingestion_status["error"] = str(e)
+    finally:
+        _ingestion_status["running"] = False
+
+
+@router.post("/start", response_model=IngestionStatus)
+async def start_ingestion(background_tasks: BackgroundTasks):
+    """Trigger full data ingestion pipeline."""
+    if _ingestion_status["running"]:
+        raise HTTPException(status_code=409, detail="Ingestion already running")
+    background_tasks.add_task(_run_ingestion_task)
+    return IngestionStatus(
+        status="started",
+        message="Ingestion pipeline started in background",
+    )
+
+
+@router.get("/status", response_model=IngestionStatus)
+async def get_ingestion_status():
+    """Get current ingestion status."""
+    if _ingestion_status["running"]:
+        status = "running"
+    elif _ingestion_status["completed"]:
+        status = "completed"
+    elif _ingestion_status["error"]:
+        status = "error"
+    else:
+        status = "idle"
+
+    return IngestionStatus(
+        status=status,
+        steps=_ingestion_status["results"],
+        message=_ingestion_status.get("error") or "",
+    )
+
+
+@router.post("/reset")
+async def reset_graph():
+    """Wipe all nodes and relationships (USE WITH CAUTION)."""
+    if _ingestion_status["running"]:
+        raise HTTPException(status_code=409, detail="Ingestion running – stop it first")
+    from database.neo4j_client import run_write_query
+    await run_write_query("MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 1000 ROWS")
+    return {"message": "Graph cleared successfully"}
+backend/api/__init__.py
+python
+undefined
+backend/database/__init__.py
+python
+undefined
+backend/ingestion/__init__.py
+python
+undefined
+backend/models/__init__.py
+python
+undefined
+backend/llm/__init__.py
+python
+undefined
+backend/main.py
+python
+import logging
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+
+from config import get_settings
+from database.neo4j_client import get_driver, close_driver
+from api.graph import router as graph_router
+from api.chat import router as chat_router
+from api.ingestion import router as ingestion_router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting SAP O2C Graph API...")
+    await get_driver()
+    logger.info("Neo4j connected")
+    yield
+    # Shutdown
+    await close_driver()
+    logger.info("Neo4j disconnected")
+
+
+settings = get_settings()
+
+app = FastAPI(
+    title="SAP O2C Graph Intelligence API",
+    description="Graph-powered Order-to-Cash analysis with LLM chat",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(graph_router)
+app.include_router(chat_router)
+app.include_router(ingestion_router)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "SAP O2C Graph API"}
+
+
+@app.get("/api/folders")
+async def list_folders():
+    """List available data folders."""
+    data_dir = settings.DATA_DIR
+    if not os.path.exists(data_dir):
+        return {"folders": []}
+    folders = [
+        f for f in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, f))
+    ]
+    result = []
+    for folder in sorted(folders):
+        folder_path = os.path.join(data_dir, folder)
+        files = []
+        for root, _, fs in os.walk(folder_path):
+            for file in fs:
+                fp = os.path.join(root, file)
+                size = os.path.getsize(fp)
+                mtime = os.path.getmtime(fp)
+                files.append({"name": file, "size": size, "modified": mtime})
+        result.append({"name": folder, "file_count": len(files), "files": files})
+    return {"folders": result, "total": len(result)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+backend/.env
+env
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-4o
+DATA_DIR=./data/sap-o2c-data
+CORS_ORIGINS=["http://localhost:3000"]
+Frontend
+frontend/package.json
+json
+{
+  "name": "sap-o2c-graph-ui",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-scripts": "5.0.1",
+    "d3": "^7.9.0",
+    "axios": "^1.7.2",
+    "react-router-dom": "^6.24.0",
+    "uuid": "^10.0.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version"]
+  },
+  "proxy": "http://localhost:8000"
+}
+frontend/.env
+env
+REACT_APP_API_URL=http://localhost:8000
+frontend/public/index.html
+html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAP O2C Graph Intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+frontend/src/services/api.js
+javascript
+import axios from "axios";
+
+const BASE_URL = process.env.REACT_APP_API_URL || "http://localhost:8000";
+
+const api = axios.create({
+  baseURL: BASE_URL,
+  timeout: 60000,
+  headers: { "Content-Type": "application/json" },
+});
+
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    console.error("API Error:", err.response?.data || err.message);
+    return Promise.reject(err);
+  }
+);
+
+// ── Graph ─────────────────────────────────────────────────────────────────────
+export const fetchGraphOverview = (limit = 300, nodeTypes = null) => {
+  const params = { limit };
+  if (nodeTypes) params.node_types = nodeTypes;
+  return api.get("/api/graph/overview", { params });
+};
+
+export const fetchNodeDetail = (nodeId) =>
+  api.get(`/api/graph/node/${nodeId}`);
+
+export const searchNodes = (q, label = null, limit = 20) => {
+  const params = { q, limit };
+  if (label) params.label = label;
+  return api.get("/api/graph/search", { params });
+};
+
+export const fetchGraphStats = () => api.get("/api/graph/stats");
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+export const sendChatMessage = (message, sessionId = "default") =>
+  api.post("/api/chat/message", { message, session_id: sessionId });
+
+export const clearChatSession = (sessionId) =>
+  api.delete(`/api/chat/session/${sessionId}`);
+
+// ── Ingestion ─────────────────────────────────────────────────────────────────
+export const startIngestion = () => api.post("/api/ingestion/start");
+export const getIngestionStatus = () => api.get("/api/ingestion/status");
+export const resetGraph = () => api.post("/api/ingestion/reset");
+
+// ── Folders ───────────────────────────────────────────────────────────────────
+export const listFolders = () => api.get("/api/folders");
+frontend/src/hooks/useGraph.js
+javascript
+import { useState, useCallback, useRef } from "react";
+import { fetchGraphOverview, fetchNodeDetail, fetchGraphStats } from "../services/api";
+
+export function useGraph() {
+  const [graphData, setGraphData] = useState({ nodes: [], edges: [] });
+  const [selectedNode, setSelectedNode] = useState(null);
+  const [highlightedIds, setHighlightedIds] = useState(new Set());
+  const [loading, setLoading] = useState(false);
+  const [stats, setStats] = useState(null);
+  const [error, setError] = useState(null);
+  const abortRef = useRef(null);
+
+  const loadGraph = useCallback(async (limit = 300, nodeTypes = null) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetchGraphOverview(limit, nodeTypes);
+      setGraphData(res.data);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadNodeDetail = useCallback(async (nodeId) => {
+    try {
+      const res = await fetchNodeDetail(nodeId);
+      setSelectedNode({ id: nodeId, ...res.data });
+    } catch (e) {
+      console.error("Node detail error:", e);
+    }
+  }, []);
+
+  const loadStats = useCallback(async () => {
+    try {
+      const res = await fetchGraphStats();
+      setStats(res.data);
+    } catch (e) {
+      console.error("Stats error:", e);
+    }
+  }, []);
+
+  const highlightNodes = useCallback((highlights) => {
+    if (!highlights || highlights.length === 0) {
+      setHighlightedIds(new Set());
+      return;
+    }
+    // highlights is [{label, properties}]
+    const ids = new Set();
+    graphData.nodes.forEach((node) => {
+      highlights.forEach((h) => {
+        if (node.label === h.label) {
+          const props = h.properties || {};
+          const nodeProps = node.properties || {};
+          const matches = Object.entries(props).some(
+            ([k, v]) => nodeProps[k] && String(nodeProps[k]) === String(v)
+          );
+          if (matches) ids.add(node.id);
+        }
+      });
+    });
+    setHighlightedIds(ids);
+  }, [graphData.nodes]);
+
+  const clearHighlights = useCallback(() => setHighlightedIds(new Set()), []);
+
+  return {
+    graphData,
+    selectedNode,
+    highlightedIds,
+    loading,
+    stats,
+    error,
+    loadGraph,
+    loadNodeDetail,
+    loadStats,
+    highlightNodes,
+    clearHighlights,
+    setSelectedNode,
+  };
+}
+frontend/src/hooks/useChat.js
+javascript
+import { useState, useCallback, useRef } from "react";
+import { sendChatMessage, clearChatSession } from "../services/api";
+import { v4 as uuidv4 } from "uuid";
+
+export function useChat() {
+  const sessionId = useRef(uuidv4());
+  const [messages, setMessages] = useState([
+    {
+      id: "welcome",
+      role: "assistant",
+      content: "Hi! I can help you analyze the **Order to Cash** process.",
+      timestamp: new Date(),
+    },
+  ]);
+  const [loading, setLoading] = useState(false);
+  const [lastQueryResult, setLastQueryResult] = useState(null);
+
+  const sendMessage = useCallback(
+    async (text, onHighlight) => {
+      if (!text.trim() || loading) return;
+
+      const userMsg = {
+        id: uuidv4(),
+        role: "user",
+        content: text,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setLoading(true);
+
+      try {
+        const res = await sendChatMessage(text, sessionId.current);
+        const data = res.data;
+
+        const assistantMsg = {
+          id: uuidv4(),
+          role: "assistant",
+          content: data.answer,
+          cypher: data.cypher,
+          results: data.results,
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+        setLastQueryResult(data);
+
+        if (onHighlight && data.highlights?.length > 0) {
+          onHighlight(data.highlights);
+        }
+      } catch (e) {
+        const errMsg = {
+          id: uuidv4(),
+          role: "assistant",
+          content: "Sorry, I encountered an error. Please try again.",
+          error: true,
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, errMsg]);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [loading]
+  );
+
+  const clearChat = useCallback(async () => {
+    await clearChatSession(sessionId.current);
+    sessionId.current = uuidv4();
+    setMessages([
+      {
+        id: "welcome",
+        role: "assistant",
+        content: "Hi! I can help you analyze the **Order to Cash** process.",
+        timestamp: new Date(),
+      },
+    ]);
+    setLastQueryResult(null);
+  }, []);
+
+  return {
+    messages,
+    loading,
+    lastQueryResult,
+    sendMessage,
+    clearChat,
+    sessionId: sessionId.current,
+  };
+}
+frontend/src/components/Sidebar/Sidebar.css
+css
+.sidebar {
+  width: 240px;
+  min-width: 240px;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #2a2a4a;
+  transition: width 0.25s ease;
+  overflow: hidden;
+  z-index: 10;
+}
+
+.sidebar.collapsed {
+  width: 0;
+  min-width: 0;
+}
+
+.sidebar-header {
+  padding: 18px 16px 12px;
+  border-bottom: 1px solid #2a2a4a;
+}
+
+.sidebar-logo {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #7eb8f7;
+  text-transform: uppercase;
+}
+
+.sidebar-subtitle {
+  font-size: 11px;
+  color: #666;
+  margin-top: 2px;
+}
+
+.sidebar-section {
+  padding: 12px 16px 6px;
+}
+
+.sidebar-section-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #555;
+  margin-bottom: 8px;
+}
+
+.sidebar-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #bbb;
+  transition: background 0.15s, color 0.15s;
+  margin-bottom: 2px;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+
+.sidebar-nav-item:hover {
+  background: #2a2a4a;
+  color: #fff;
+}
+
+.sidebar-nav-item.active {
+  background: #1e3a5f;
+  color: #7eb8f7;
+  font-weight: 500;
+}
+
+.sidebar-nav-item .icon {
+  font-size: 15px;
+  width: 20px;
+  text-align: center;
+}
+
+.sidebar-stats {
+  margin-top: auto;
+  padding: 12px 16px;
+  border-top: 1px solid #2a2a4a;
+  font-size: 11px;
+  color: #555;
+}
+
+.stats-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.stats-value {
+  color: #7eb8f7;
+  font-weight: 600;
+}
+frontend/src/components/Sidebar/Sidebar.jsx
+jsx
+import React from "react";
+import "./Sidebar.css";
+
+const NAV_ITEMS = [
+  { id: "browser",  icon: "🗂", label: "Data Browser" },
+  { id: "graph",    icon: "🕸", label: "Graph View" },
+];
+
+export default function Sidebar({ activeView, onViewChange, collapsed, stats }) {
+  return (
+    <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
+      <div className="sidebar-header">
+        <div className="sidebar-logo">SAP O2C Graph</div>
+        <div className="sidebar-subtitle">Intelligence Platform</div>
+      </div>
+
+      <div className="sidebar-section">
+        <div className="sidebar-section-title">Navigation</div>
+        {NAV_ITEMS.map((item) => (
+          <button
+            key={item.id}
+            className={`sidebar-nav-item ${activeView === item.id ? "active" : ""}`}
+            onClick={() => onViewChange(item.id)}
+          >
+            <span className="icon">{item.icon}</span>
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      {stats && (
+        <div className="sidebar-stats">
+          <div className="sidebar-section-title">Graph Stats</div>
+          {stats.node_counts?.slice(0, 6).map((s) => (
+            <div className="stats-row" key={s.label}>
+              <span>{s.label}</span>
+              <span className="stats-value">{s.count?.toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </aside>
+  );
+}
+frontend/src/components/DataBrowser/DataBrowser.css
+css
+.data-browser {
+  flex: 1;
+  background: #f5f5f5;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.db-header {
+  background: #fff;
+  border-bottom: 1px solid #e0e0e0;
+  padding: 20px 28px 16px;
+}
+
+.db-breadcrumb {
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+.db-breadcrumb span {
+  color: #333;
+  font-weight: 600;
+}
+
+.db-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: #111;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.db-count-badge {
+  font-size: 13px;
+  font-weight: 400;
+  color: #888;
+  background: #f0f0f0;
+  padding: 2px 10px;
+  border-radius: 12px;
+}
+
+.db-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.db-search {
+  padding: 7px 14px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 13px;
+  width: 260px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.db-search:focus {
+  border-color: #4a90e2;
+}
+
+.db-ingest-btn {
+  margin-left: auto;
+  padding: 7px 18px;
+  background: #4a90e2;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.db-ingest-btn:hover {
+  background: #357abd;
+}
+
+.db-ingest-btn:disabled {
+  background: #aaa;
+  cursor: not-allowed;
+}
+
+.db-ingest-btn.running {
+  background: #e8a020;
+  animation: pulse 1.2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.7; }
+}
+
+.db-table-wrapper {
+  flex: 1;
+  overflow-y: auto;
+  background: #fff;
+  margin: 16px 28px;
+  border-radius: 10px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+
+.db-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.db-table th {
+  padding: 12px 16px;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  color: #888;
+  border-bottom: 1px solid #eee;
+  position: sticky;
+  top: 0;
+  background: #fff;
+  z-index: 1;
+}
+
+.db-table td {
+  padding: 11px 16px;
+  font-size: 13px;
+  color: #444;
+  border-bottom: 1px solid #f5f5f5;
+  vertical-align: middle;
+}
+
+.db-table tr:hover td {
+  background: #f9fbff;
+}
+
+.folder-icon {
+  color: #888;
+  font-size: 16px;
+  margin-right: 4px;
+}
+
+.folder-name {
+  color: #2563eb;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.folder-name:hover {
+  text-decoration: underline;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 6px;
+}
+
+.status-dot.success { background: #22c55e; }
+.status-dot.error   { background: #ef4444; }
+.status-dot.running { background: #f59e0b; }
+.status-dot.idle    { background: #ccc; }
+
+.ingestion-status-bar {
+  margin: 0 28px 12px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ingestion-status-bar.success { background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; }
+.ingestion-status-bar.error   { background: #fef2f2; border: 1px solid #fca5a5; color: #7f1d1d; }
+.ingestion-status-bar.running { background: #fffbeb; border: 1px solid #fcd34d; color: #78350f; }
+
+.progress-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 28px 12px;
+}
+
+.step-badge {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.step-badge.success { background: #dcfce7; color: #166534; }
+.step-badge.error   { background: #fee2e2; color: #991b1b; }
+frontend/src/components/DataBrowser/DataBrowser.jsx
+jsx
+import React, { useEffect, useState, useCallback } from "react";
+import {
+  listFolders,
+  startIngestion,
+  getIngestionStatus,
+} from "../../services/api";
+import "./DataBrowser.css";
+
+const FOLDERS_META = {
+  billing_document_cancellations: "Billing Cancellations",
+  billing_document_headers: "Billing Document Headers",
+  billing_document_items: "Billing Document Items",
+  business_partner_addresses: "Business Partner Addresses",
+  business_partners: "Business Partners",
+  customer_company_assignments: "Customer Company Assignments",
+  customer_sales_area_assignments: "Customer Sales Area Assignments",
+  journal_entry_items_accounts_receivable: "Journal Entry AR Items",
+  outbound_delivery_headers: "Outbound Delivery Headers",
+  outbound_delivery_items: "Outbound Delivery Items",
+  payments_accounts_receivable: "Payments AR",
+  plants: "Plants",
+  product_descriptions: "Product Descriptions",
+  product_plants: "Product Plants",
+  product_storage_locations: "Product Storage Locations",
+  products: "Products",
+  sales_order_headers: "Sales Order Headers",
+  sales_order_items: "Sales Order Items",
+  sales_order_schedule_lines: "Sales Order Schedule Lines",
+};
+
+function formatBytes(bytes) {
+  if (!bytes) return "-";
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
+}
+
+function formatDate(ts) {
+  if (!ts) return "-";
+  return new Date(ts * 1000).toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+export default function DataBrowser({ onNavigateToGraph }) {
+  const [folders, setFolders] = useState([]);
+  const [search, setSearch] = useState("");
+  const [ingestionStatus, setIngestionStatus] = useState(null);
+  const [ingestionRunning, setIngestionRunning] = useState(false);
+  const [ingestionSteps, setIngestionSteps] = useState([]);
+
+  const loadFolders = useCallback(async () => {
+    try {
+      const res = await listFolders();
+      setFolders(res.data.folders || []);
+    } catch {
+      // Build placeholder list from known folders
+      setFolders(
+        Object.keys(FOLDERS_META).map((name) => ({
+          name,
+          file_count: 0,
+          files: [],
+        }))
+      );
+    }
+  }, []);
+
+  const pollStatus = useCallback(async () => {
+    try {
+      const res = await getIngestionStatus();
+      const data = res.data;
+      setIngestionStatus(data.status);
+      setIngestionSteps(data.steps || []);
+      if (data.status === "running") {
+        setIngestionRunning(true);
+        setTimeout(pollStatus, 2000);
+      } else {
+        setIngestionRunning(false);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    loadFolders();
+    pollStatus();
+  }, [loadFolders, pollStatus]);
+
+  const handleIngest = async () => {
+    try {
+      await startIngestion();
+      setIngestionRunning(true);
+      setTimeout(pollStatus, 1500);
+    } catch (e) {
+      alert(e.response?.data?.detail || "Failed to start ingestion");
+    }
+  };
+
+  const filtered = folders.filter((f) =>
+    f.name.toLowerCase().includes(search.toLowerCase())
+  );
+
+  const totalSize = folders.reduce(
+    (acc, f) => acc + (f.files || []).reduce((s, file) => s + (file.size || 0), 0),
+    0
+  );
+
+  return (
+    <div className="data-browser">
+      <div className="db-header">
+        <div className="db-breadcrumb">
+          Storage / <span>sap-o2c-data</span>
+        </div>
+        <div className="db-title">
+          sap-o2c-data
+          <span className="db-count-badge">{folders.length} items</span>
+        </div>
+        <div className="db-toolbar">
+          <input
+            className="db-search"
+            placeholder="Search folders..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <button
+            className={`db-ingest-btn ${ingestionRunning ? "running" : ""}`}
+            onClick={handleIngest}
+            disabled={ingestionRunning}
+          >
+            {ingestionRunning ? "⚙ Ingesting..." : "⚡ Ingest to Graph"}
+          </button>
+          <button
+            className="db-ingest-btn"
+            style={{ background: "#6366f1" }}
+            onClick={onNavigateToGraph}
+          >
+            🕸 Open Graph
+          </button>
+        </div>
+      </div>
+
+      {/* Ingestion Status Bar */}
+      {ingestionStatus && ingestionStatus !== "idle" && (
+        <div className={`ingestion-status-bar ${ingestionStatus}`}>
+          <span
+            className={`status-dot ${ingestionStatus}`}
+          />
+          {ingestionStatus === "running" && "Ingestion pipeline is running..."}
+          {ingestionStatus === "completed" && `✓ Ingestion completed successfully — ${ingestionSteps.length} steps`}
+          {ingestionStatus === "error" && "✗ Ingestion encountered errors"}
+        </div>
+      )}
+
+      {ingestionSteps.length > 0 && (
+        <div className="progress-steps">
+          {ingestionSteps.map((step, i) => (
+            <span
+              key={i}
+              className={`step-badge ${step.status}`}
+              title={step.error || ""}
+            >
+              {step.status === "success" ? "✓" : "✗"} {step.step}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="db-table-wrapper">
+        <table className="db-table">
+          <thead>
+            <tr>
+              <th style={{ width: 40 }}></th>
+              <th>Name</th>
+              <th>Files</th>
+              <th>Last Modified</th>
+              <th>Total Size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((folder) => {
+              const lastModified = folder.files?.reduce(
+                (max, f) => Math.max(max, f.modified || 0),
+                0
+              );
+              const size = folder.files?.reduce(
+                (acc, f) => acc + (f.size || 0),
+                0
+              );
+              return (
+                <tr key={folder.name}>
+                  <td>
+                    <span className="folder-icon">📁</span>
+                  </td>
+                  <td>
+                    <span
+                      className="folder-name"
+                      onClick={onNavigateToGraph}
+                    >
+                      {folder.name}
+                    </span>
+                  </td>
+                  <td>{folder.file_count || "-"}</td>
+                  <td>{lastModified ? formatDate(lastModified) : "-"}</td>
+                  <td>{size ? formatBytes(size) : "-"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+frontend/src/components/NodeTooltip/NodeTooltip.css
+css
+.node-tooltip {
+  position: absolute;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+  padding: 16px 18px;
+  min-width: 280px;
+  max-width: 360px;
+  z-index: 1000;
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.node-tooltip-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eee;
+}
+
+.node-tooltip-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 5px;
+  line-height: 1.4;
+}
+
+.node-tooltip-key {
+  font-weight: 600;
+  color: #555;
+  min-width: 90px;
+  flex-shrink: 0;
+}
+
+.node-tooltip-val {
+  color: #222;
+  word-break: break-word;
+  flex: 1;
+}
+
+.node-tooltip-hidden {
+  font-style: italic;
+  color: #aaa;
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+.node-tooltip-connections {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #eee;
+  font-weight: 600;
+  color: #333;
+}
+frontend/src/components/NodeTooltip/NodeTooltip.jsx
+jsx
+import React from "react";
+import "./NodeTooltip.css";
+
+const PRIORITY_KEYS = [
+  "SalesOrder", "BillingDocument", "OutboundDelivery",
+  "AccountingDocument", "PaymentDocument", "BusinessPartner",
+  "Product", "Plant", "CompanyCode", "FiscalYear",
+  "GlAccount", "AmountInTransactionCurrency", "TransactionCurrency",
+  "AmountInCompanyCodeCurrency", "CompanyCodeCurrency",
+  "PostingDate", "DocumentDate", "ReferenceDocument",
+  "AccountingDocumentType", "AccountingDocumentItem",
+  "CostCenter", "ProfitCenter",
+];
+
+const MAX_VISIBLE = 14;
+
+export default function NodeTooltip({ node, x, y, connections = 0 }) {
+  if (!node) return null;
+
+  const props = node.properties || {};
+  const entries = Object.entries(props).filter(
+    ([, v]) => v !== null && v !== undefined && v !== ""
+  );
+
+  // Sort by priority
+  const sorted = [
+    ...entries.filter(([k]) => PRIORITY_KEYS.includes(k)),
+    ...entries.filter(([k]) => !PRIORITY_KEYS.includes(k)),
+  ];
+
+  const visible = sorted.slice(0, MAX_VISIBLE);
+  const hidden = sorted.length - MAX_VISIBLE;
+
+  // Position tooltip so it doesn't go off screen
+  const style = {
+    left: Math.min(x + 16, window.innerWidth - 380),
+    top: Math.min(y - 10, window.innerHeight - 400),
+  };
+
+  return (
+    <div className="node-tooltip" style={style}>
+      <div className="node-tooltip-title">{node.label}</div>
+      {visible.map(([k, v]) => (
+        <div className="node-tooltip-row" key={k}>
+          <span className="node-tooltip-key">{k}:</span>
+          <span className="node-tooltip-val">{String(v)}</span>
+        </div>
+      ))}
+      {hidden > 0 && (
+        <div className="node-tooltip-hidden">
+          Additional {hidden} fields hidden for readability
+        </div>
+      )}
+      <div className="node-tooltip-connections">
+        Connections: {connections}
+      </div>
+    </div>
+  );
+}
+frontend/src/components/ChatPanel/ChatPanel.css
+css
+.chat-panel {
+  width: 280px;
+  min-width: 280px;
+  background: #fff;
+  border-left: 1px solid #e8e8e8;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.chat-header {
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid #eee;
+  flex-shrink: 0;
+}
+
+.chat-header-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #111;
+}
+
+.chat-header-sub {
+  font-size: 11px;
+  color: #888;
+  margin-top: 1px;
+}
+
+.chat-agent-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #eee;
+  flex-shrink: 0;
+}
+
+.chat-agent-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #1e3a5f, #4a90e2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.chat-agent-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #111;
+}
+
+.chat-agent-role {
+  font-size: 11px;
+  color: #888;
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scroll-behavior: smooth;
+}
+
+.chat-messages::-webkit-scrollbar {
+  width: 4px;
+}
+.chat-messages::-webkit-scrollbar-thumb {
+  background: #ddd;
+  border-radius: 2px;
+}
+
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+}
+
+.chat-msg.user {
+  align-items: flex-end;
+}
+
+.chat-msg.assistant {
+  align-items: flex-start;
+}
+
+.chat-bubble {
+  padding: 9px 13px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 95%;
+  word-break: break-word;
+}
+
+.chat-msg.user .chat-bubble {
+  background: #1e3a5f;
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.chat-msg.assistant .chat-bubble {
+  background: #f5f5f5;
+  color: #222;
+  border-bottom-left-radius: 4px;
+}
+
+.chat-msg.assistant .chat-bubble.error {
+  background: #fff0f0;
+  border: 1px solid #fca5a5;
+}
+
+.chat-bubble strong {
+  font-weight: 700;
+}
+
+.chat-cypher-toggle {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #4a90e2;
+  cursor: pointer;
+  user-select: none;
+  padding-left: 2px;
+}
+
+.chat-cypher-block {
+  margin-top: 4px;
+  background: #1a1a2e;
+  color: #7eb8f7;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.chat-msg-time {
+  font-size: 10px;
+  color: #bbb;
+  margin-top: 3px;
+  padding: 0 2px;
+}
+
+.chat-user-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-bottom: 2px;
+}
+
+.chat-user-label {
+  font-size: 11px;
+  color: #888;
+  font-weight: 500;
+}
+
+.chat-user-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #e0e0e0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+
+.chat-status-bar {
+  padding: 8px 16px;
+  border-top: 1px solid #eee;
+  border-bottom: 1px solid #eee;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: #555;
+  flex-shrink: 0;
+}
+
+.status-indicator {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+
+.status-indicator.thinking {
+  background: #f59e0b;
+  animation: blink 0.8s infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+.chat-input-area {
+  padding: 10px 12px 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+
+.chat-input {
+  flex: 1;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  outline: none;
+  resize: none;
+  max-height: 100px;
+  font-family: inherit;
+  line-height: 1.4;
+  transition: border-color 0.15s;
+}
+
+.chat-input:focus {
+  border-color: #4a90e2;
+}
+
+.chat-send-btn {
+  padding: 9px 16px;
+  background: #1e3a5f;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+  white-space: nowrap;
+}
+
+.chat-send-btn:hover:not(:disabled) {
+  background: #2a5080;
+}
+
+.chat-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.chat-clear-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  background: none;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #888;
+  margin-left: auto;
+  transition: all 0.15s;
+}
+
+.chat-clear-btn:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #dc2626;
+}
+
+.typing-dots {
+  display: flex;
+  gap: 4px;
+  padding: 10px 13px;
+  background: #f5f5f5;
+  border-radius: 12px;
+  border-bottom-left-radius: 4px;
+  align-items: center;
+}
+
+.typing-dot {
+  width: 6px;
+  height: 6px;
+  background: #aaa;
+  border-radius: 50%;
+  animation: typing 1.2s infinite;
+}
+
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes typing {
+  0%, 60%, 100% { transform: translateY(0); }
+  30%            { transform: translateY(-5px); }
+}
+frontend/src/components/ChatPanel/ChatPanel.jsx
+jsx
+import React, { useRef, useEffect, useState } from "react";
+import "./ChatPanel.css";
+
+function formatTime(date) {
+  return new Date(date).toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function renderMarkdown(text) {
+  if (!text) return "";
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "<strong>\$1</strong>")
+    .replace(/\*(.*?)\*/g, "<em>\$1</em>")
+    .replace(/`(.*?)`/g, '<code style="background:#eee;padding:1px 4px;border-radius:3px;font-size:11px">\$1</code>')
+    .replace(/\n/g, "<br/>");
+}
+
+function Message({ msg }) {
+  const [showCypher, setShowCypher] = useState(false);
+
+  return (
+    <div className={`chat-msg ${msg.role}`}>
+      {msg.role === "user" && (
+        <div className="chat-user-row">
+          <span className="chat-user-label">You</span>
+          <div className="chat-user-avatar">👤</div>
+        </div>
+      )}
+      <div
+        className={`chat-bubble ${msg.error ? "error" : ""}`}
+        dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+      />
+      {msg.cypher && (
+        <>
+          <span
+            className="chat-cypher-toggle"
+            onClick={() => setShowCypher(!showCypher)}
+          >
+            {showCypher ? "▲ Hide" : "▼ Show"} Cypher query
+          </span>
+          {showCypher && (
+            <pre className="chat-cypher-block">{msg.cypher}</pre>
+          )}
+        </>
+      )}
+      <span className="chat-msg-time">{formatTime(msg.timestamp)}</span>
+    </div>
+  );
+}
+
+export default function ChatPanel({ messages, loading, onSend, onClear }) {
+  const [input, setInput] = useState("");
+  const messagesEndRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  const handleSend = () => {
+    const trimmed = input.trim();
+    if (!trimmed || loading) return;
+    onSend(trimmed);
+    setInput("");
+    textareaRef.current?.focus();
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <div className="chat-panel">
+      {/* Header */}
+      <div className="chat-header">
+        <div className="chat-header-title">Chat with Graph</div>
+        <div className="chat-header-sub">Order to Cash</div>
+      </div>
+
+      {/* Agent Info */}
+      <div className="chat-agent-info">
+        <div className="chat-agent-avatar">D</div>
+        <div>
+          <div className="chat-agent-name">Dodge AI</div>
+          <div className="chat-agent-role">Graph Agent</div>
+        </div>
+        <button className="chat-clear-btn" onClick={onClear}>
+          Clear
+        </button>
+      </div>
+
+      {/* Messages */}
+      <div className="chat-messages">
+        {messages.map((msg) => (
+          <Message key={msg.id} msg={msg} />
+        ))}
+        {loading && (
+          <div className="chat-msg assistant">
+            <div className="typing-dots">
+              <div className="typing-dot" />
+              <div className="typing-dot" />
+              <div className="typing-dot" />
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Status */}
+      <div className="chat-status-bar">
+        <div className={`status-indicator ${loading ? "thinking" : ""}`} />
+        {loading ? "Dodge AI is thinking..." : "Dodge AI is awaiting instructions"}
+      </div>
+
+      {/* Input */}
+      <div className="chat-input-area">
+        <textarea
+          ref={textareaRef}
+          className="chat-input"
+          placeholder="Analyze anything"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          rows={1}
+        />
+        <button
+          className="chat-send-btn"
+          onClick={handleSend}
+          disabled={loading || !input.trim()}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+frontend/src/components/GraphViewer/GraphViewer.css
+css
+.graph-viewer {
+  flex: 1;
+  position: relative;
+  background: #f8f9fb;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.graph-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  gap: 8px;
+  z-index: 20;
+}
+
+.graph-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  background: rgba(0,0,0,0.78);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+  backdrop-filter: blur(4px);
+}
+
+.graph-btn:hover {
+  background: rgba(0,0,0,0.9);
+}
+
+.graph-btn.active {
+  background: #1e3a5f;
+}
+
+.graph-canvas {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+}
+
+.graph-canvas svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* D3 node styles */
+.graph-node circle {
+  cursor: pointer;
+  transition: r 0.15s;
+}
+
+.graph-node text {
+  font-size: 9px;
+  fill: #555;
+  pointer-events: none;
+  user-select: none;
+}
+
+.graph-link {
+  stroke: #b0c8e8;
+  stroke-opacity: 0.55;
+  stroke-width: 1;
+  fill: none;
+}
+
+.graph-link.highlighted {
+  stroke: #f59e0b;
+  stroke-opacity: 0.9;
+  stroke-width: 2;
+}
+
+/* Legend */
+.graph-legend {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 11px;
+  backdrop-filter: blur(4px);
+  z-index: 10;
+}
+
+.legend-title {
+  font-weight: 700;
+  color: #333;
+  margin-bottom: 6px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+  color: #555;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Loading overlay */
+.graph-loading {
+  position: absolute;
+  inset: 0;
+  background: rgba(248,249,251,0.85);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+  gap: 14px;
+}
+
+.graph-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid #e0e0e0;
+  border-top-color: #4a90e2;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.graph-loading-text {
+  font-size: 13px;
+  color: #888;
+}
+
+/* Node type filter bar */
+.node-type-filters {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-width: 300px;
+  z-index: 20;
+  justify-content: flex-end;
+}
+
+.filter-chip {
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1.5px solid transparent;
+  transition: all 0.15s;
+  color: #fff;
+  opacity: 0.55;
+}
+
+.filter-chip.active {
+  opacity: 1;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+}
+
+.graph-stats-bar {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: #555;
+  backdrop-filter: blur(4px);
+  z-index: 10;
+}
+
+.graph-stats-bar strong {
+  color: #333;
+}
+frontend/src/components/GraphViewer/GraphViewer.jsx
+jsx
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
+import * as d3 from "d3";
+import NodeTooltip from "../NodeTooltip/NodeTooltip";
+import "./GraphViewer.css";
+
+// Color palette per node label
+const LABEL_COLORS = {
+  SalesOrder:            "#4a90e2",
+  SalesOrderItem:        "#63b3ed",
+  SalesOrderScheduleLine:"#90cdf4",
+  OutboundDelivery:      "#48bb78",
+  OutboundDeliveryItem:  "#9ae6b4",
+  BillingDocument:       "#f6ad55",
+  BillingDocumentItem:   "#fbd38d",
+  BillingCancellation:   "#fc8181",
+  JournalEntry:          "#b794f4",
+  Payment:               "#68d391",
+  BusinessPartner:       "#f687b3",
+  BusinessPartnerAddress:"#fbb6ce",
+  CustomerCompany:       "#76e4f7",
+  CustomerSalesArea:     "#81e6d9",
+  Product:               "#faf089",
+  ProductDescription:    "#fefcbf",
+  ProductPlant:          "#c6f6d5",
+  ProductStorageLocation:"#bee3f8",
+  Plant:                 "#e9d8fd",
+};
+
+const DEFAULT_COLOR = "#cbd5e0";
+
+function getColor(label) {
+  return LABEL_COLORS[label] || DEFAULT_COLOR;
+}
+
+function getRadius(label, highlighted) {
+  const large = ["SalesOrder", "BillingDocument", "BusinessPartner", "OutboundDelivery"];
+  const base = large.includes(label) ? 7 : 5;
+  return highlighted ? base + 3 : base;
+}
+
+const NODE_TYPES = Object.keys(LABEL_COLORS);
+
+const GraphViewer = forwardRef(function GraphViewer(
+  { graphData, loading, highlightedIds, onNodeClick },
+  ref
+) {
+  const svgRef = useRef(null);
+  const containerRef = useRef(null);
+  const simulationRef = useRef(null);
+  const [tooltip, setTooltip] = useState(null);
+  const [showOverlay, setShowOverlay] = useState(true);
+  const [activeFilters, setActiveFilters] = useState(new Set(NODE_TYPES));
+  const [dimensions, setDimensions] = useState({ w: 800, h: 600 });
+
+  // Expose reset method to parent
+  useImperativeHandle(ref, () => ({
+    resetZoom: () => {
+      if (svgRef.current) {
+        d3.select(svgRef.current)
+          .transition()
+          .duration(600)
+          .call(zoomRef.current?.transform, d3.zoomIdentity);
+      }
+    },
+  }));
+
+  const zoomRef = useRef(null);
+
+  // Track container size
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        setDimensions({ w: width, h: height });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const buildGraph = useCallback(() => {
+    if (!svgRef.current || !graphData?.nodes?.length) return;
+
+    const { w, h } = dimensions;
+    const nodes = graphData.nodes.filter((n) => activeFilters.has(n.label));
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const links = (graphData.edges || []).filter(
+      (e) => nodeIds.has(String(e.source)) && nodeIds.has(String(e.target))
+    );
+
+    // Clear previous
+    d3.select(svgRef.current).selectAll("*").remove();
+
+    const svg = d3
+      .select(svgRef.current)
+      .attr("width", w)
+      .attr("height", h);
+
+    // Zoom
+    const g = svg.append("g");
+    const zoom = d3
+      .zoom()
+      .scaleExtent([0.05, 8])
+      .on("zoom", (event) => g.attr("transform", event.transform));
+    zoomRef.current = zoom;
+    svg.call(zoom);
+
+    // Defs – arrowhead
+    svg
+      .append("defs")
+      .append("marker")
+      .attr("id", "arrow")
+      .attr("viewBox", "0 -4 8 8")
+      .attr("refX", 14)
+      .attr("refY", 0)
+      .attr("markerWidth", 5)
+      .attr("markerHeight", 5)
+      .attr("orient", "auto")
+      .append("path")
+      .attr("d", "M0,-4L8,0L0,4")
+      .attr("fill", "#b0c8e8")
+      .attr("opacity", 0.5);
+
+    // Links
+    const link = g
+      .append("g")
+      .attr("class", "links")
+      .selectAll("line")
+      .data(links)
+      .join("line")
+      .attr("class", "graph-link")
+      .attr("marker-end", "url(#arrow)");
+
+    // Node groups
+    const node = g
+      .append("g")
+      .attr("class", "nodes")
+      .selectAll("g")
+      .data(nodes)
+      .join("g")
+      .attr("class", "graph-node")
+      .call(
+        d3
+          .drag()
+          .on("start", (event, d) => {
+            if (!event.active) simulationRef.current?.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+          
+Claude Sonnet 4.6
+continue complete it entirely
+
+
+Thought Process
+expand
+Continuing from the drag handler in GraphViewer.jsx:
+
+frontend/src/components/GraphViewer/GraphViewer.jsx (complete)
+jsx
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
+import * as d3 from "d3";
+import NodeTooltip from "../NodeTooltip/NodeTooltip";
+import "./GraphViewer.css";
+
+const LABEL_COLORS = {
+  SalesOrder:             "#4a90e2",
+  SalesOrderItem:         "#63b3ed",
+  SalesOrderScheduleLine: "#90cdf4",
+  OutboundDelivery:       "#48bb78",
+  OutboundDeliveryItem:   "#9ae6b4",
+  BillingDocument:        "#f6ad55",
+  BillingDocumentItem:    "#fbd38d",
+  BillingCancellation:    "#fc8181",
+  JournalEntry:           "#b794f4",
+  Payment:                "#68d391",
+  BusinessPartner:        "#f687b3",
+  BusinessPartnerAddress: "#fbb6ce",
+  CustomerCompany:        "#76e4f7",
+  CustomerSalesArea:      "#81e6d9",
+  Product:                "#faf089",
+  ProductDescription:     "#fefcbf",
+  ProductPlant:           "#c6f6d5",
+  ProductStorageLocation: "#bee3f8",
+  Plant:                  "#e9d8fd",
+};
+
+const DEFAULT_COLOR = "#cbd5e0";
+const NODE_TYPES = Object.keys(LABEL_COLORS);
+
+function getColor(label) {
+  return LABEL_COLORS[label] || DEFAULT_COLOR;
+}
+
+function getRadius(label) {
+  const large = ["SalesOrder", "BillingDocument", "BusinessPartner", "OutboundDelivery"];
+  const medium = ["JournalEntry", "Payment", "Product", "Plant"];
+  if (large.includes(label)) return 8;
+  if (medium.includes(label)) return 6;
+  return 4;
+}
+
+const GraphViewer = forwardRef(function GraphViewer(
+  { graphData, loading, highlightedIds = new Set(), onNodeClick },
+  ref
+) {
+  const svgRef        = useRef(null);
+  const containerRef  = useRef(null);
+  const simulationRef = useRef(null);
+  const zoomRef       = useRef(null);
+  const gRef          = useRef(null);
+
+  const [tooltip,      setTooltip]      = useState(null);
+  const [showOverlay,  setShowOverlay]  = useState(true);
+  const [activeFilters,setActiveFilters]= useState(new Set(NODE_TYPES));
+  const [dimensions,   setDimensions]   = useState({ w: 900, h: 600 });
+
+  /* ── expose resetZoom to parent ─────────────────────────────────────────── */
+  useImperativeHandle(ref, () => ({
+    resetZoom: () => {
+      if (svgRef.current && zoomRef.current) {
+        d3.select(svgRef.current)
+          .transition()
+          .duration(600)
+          .call(zoomRef.current.transform, d3.zoomIdentity);
+      }
+    },
+  }));
+
+  /* ── resize observer ────────────────────────────────────────────────────── */
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) {
+        const { width, height } = e.contentRect;
+        if (width > 0 && height > 0) setDimensions({ w: width, h: height });
+      }
+    });
+    ro.observe(el);
+    setDimensions({ w: el.clientWidth, h: el.clientHeight });
+    return () => ro.disconnect();
+  }, []);
+
+  /* ── main D3 render ─────────────────────────────────────────────────────── */
+  const buildGraph = useCallback(() => {
+    if (!svgRef.current) return;
+    if (!graphData?.nodes?.length) return;
+
+    const { w, h } = dimensions;
+
+    /* filter nodes by active type chips */
+    const visibleNodes = graphData.nodes.filter((n) => activeFilters.has(n.label));
+    const visibleIds   = new Set(visibleNodes.map((n) => n.id));
+    const visibleLinks = (graphData.edges || []).filter(
+      (e) =>
+        visibleIds.has(String(e.source)) && visibleIds.has(String(e.target))
+    );
+
+    /* clone so D3 can mutate x/y */
+    const nodes = visibleNodes.map((n) => ({ ...n }));
+    const links = visibleLinks.map((e) => ({
+      source: String(e.source),
+      target: String(e.target),
+      type:   e.type,
+    }));
+
+    /* ── clear ── */
+    d3.select(svgRef.current).selectAll("*").remove();
+
+    const svg = d3
+      .select(svgRef.current)
+      .attr("width",  w)
+      .attr("height", h)
+      .style("cursor", "grab");
+
+    /* ── defs: arrowhead ── */
+    const defs = svg.append("defs");
+    defs
+      .append("marker")
+      .attr("id",          "arrow")
+      .attr("viewBox",     "0 -4 8 8")
+      .attr("refX",        16)
+      .attr("refY",        0)
+      .attr("markerWidth", 4)
+      .attr("markerHeight",4)
+      .attr("orient",      "auto")
+      .append("path")
+      .attr("d",    "M0,-4L8,0L0,4")
+      .attr("fill", "#b0c8e8")
+      .attr("opacity", 0.6);
+
+    /* ── zoom ── */
+    const g = svg.append("g");
+    gRef.current = g;
+
+    const zoom = d3
+      .zoom()
+      .scaleExtent([0.03, 10])
+      .on("zoom", (event) => g.attr("transform", event.transform));
+    zoomRef.current = zoom;
+    svg.call(zoom);
+
+    /* ── links ── */
+    const linkSel = g
+      .append("g")
+      .selectAll("line")
+      .data(links)
+      .join("line")
+      .attr("stroke",       "#b0c8e8")
+      .attr("stroke-opacity", 0.5)
+      .attr("stroke-width", 1)
+      .attr("marker-end",   "url(#arrow)");
+
+    /* ── nodes ── */
+    const nodeSel = g
+      .append("g")
+      .selectAll("g")
+      .data(nodes, (d) => d.id)
+      .join("g")
+      .style("cursor", "pointer")
+      .call(
+        d3
+          .drag()
+          .on("start", (event, d) => {
+            if (!event.active)
+              simulationRef.current?.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+          })
+          .on("drag", (event, d) => {
+            d.fx = event.x;
+            d.fy = event.y;
+          })
+          .on("end", (event, d) => {
+            if (!event.active)
+              simulationRef.current?.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+          })
+      );
+
+    /* circle */
+    nodeSel
+      .append("circle")
+      .attr("r",           (d) => getRadius(d.label))
+      .attr("fill",        (d) => getColor(d.label))
+      .attr("stroke",      (d) =>
+        highlightedIds.has(d.id) ? "#f59e0b" : "rgba(255,255,255,0.4)"
+      )
+      .attr("stroke-width",(d) => (highlightedIds.has(d.id) ? 3 : 1));
+
+    /* label – only for highlighted or large nodes */
+    nodeSel
+      .append("text")
+      .attr("dy",        "0.35em")
+      .attr("x",         (d) => getRadius(d.label) + 3)
+      .attr("font-size", "9px")
+      .attr("fill",      "#555")
+      .attr("pointer-events", "none")
+      .text((d) =>
+        highlightedIds.has(d.id)
+          ? d.display_id?.slice(0, 12) || d.label
+          : ""
+      );
+
+    /* hover tooltip */
+    nodeSel
+      .on("mouseover", (event, d) => {
+        const [px, py] = d3.pointer(event, containerRef.current);
+        // Count connections
+        const connCount = links.filter(
+          (l) =>
+            String(l.source.id || l.source) === d.id ||
+            String(l.target.id || l.target) === d.id
+        ).length;
+        setTooltip({ node: d, x: px, y: py, connections: connCount });
+      })
+      .on("mousemove", (event) => {
+        const [px, py] = d3.pointer(event, containerRef.current);
+        setTooltip((prev) => prev ? { ...prev, x: px, y: py } : prev);
+      })
+      .on("mouseout", () => setTooltip(null))
+      .on("click", (event, d) => {
+        event.stopPropagation();
+        onNodeClick && onNodeClick(d);
+      });
+
+    /* ── simulation ── */
+    if (simulationRef.current) simulationRef.current.stop();
+
+    const sim = d3
+      .forceSimulation(nodes)
+      .force(
+        "link",
+        d3
+          .forceLink(links)
+          .id((d) => d.id)
+          .distance(60)
+          .strength(0.4)
+      )
+      .force("charge", d3.forceManyBody().strength(-120).distanceMax(300))
+      .force("center", d3.forceCenter(w / 2, h / 2))
+      .force("collision", d3.forceCollide().radius((d) => getRadius(d.label) + 3))
+      .alphaDecay(0.025);
+
+    simulationRef.current = sim;
+
+    sim.on("tick", () => {
+      linkSel
+        .attr("x1", (d) => d.source.x)
+        .attr("y1", (d) => d.source.y)
+        .attr("x2", (d) => d.target.x)
+        .attr("y2", (d) => d.target.y);
+
+      nodeSel.attr("transform", (d) => `translate(${d.x},${d.y})`);
+    });
+
+    /* initial zoom to fit after simulation cools */
+    sim.on("end", () => {
+      const padding = 40;
+      const xs = nodes.map((n) => n.x);
+      const ys = nodes.map((n) => n.y);
+      const x0 = Math.min(...xs) - padding;
+      const y0 = Math.min(...ys) - padding;
+      const x1 = Math.max(...xs) + padding;
+      const y1 = Math.max(...ys) + padding;
+      const bw = x1 - x0 || 1;
+      const bh = y1 - y0 || 1;
+      const scale = Math.min(0.9, Math.min(w / bw, h / bh));
+      const tx = (w - scale * (x0 + x1)) / 2;
+      const ty = (h - scale * (y0 + y1)) / 2;
+      svg
+        .transition()
+        .duration(800)
+        .call(
+          zoom.transform,
+          d3.zoomIdentity.translate(tx, ty).scale(scale)
+        );
+    });
+
+    return () => sim.stop();
+  }, [graphData, dimensions, activeFilters, highlightedIds, onNodeClick]);
+
+  /* rebuild whenever deps change */
+  useEffect(() => {
+    buildGraph();
+  }, [buildGraph]);
+
+  /* update circle colours when highlights change without full rebuild */
+  useEffect(() => {
+    if (!gRef.current) return;
+    gRef.current
+      .selectAll(".graph-node circle, g circle")
+      .attr("stroke",       (d) =>
+        d && highlightedIds.has(d.id) ? "#f59e0b" : "rgba(255,255,255,0.4)"
+      )
+      .attr("stroke-width", (d) =>
+        d && highlightedIds.has(d.id) ? 3 : 1
+      )
+      .attr("r",            (d) =>
+        d ? getRadius(d.label) + (highlightedIds.has(d.id) ? 3 : 0) : 4
+      );
+
+    gRef.current
+      .selectAll("g text")
+      .text((d) =>
+        d && highlightedIds.has(d.id)
+          ? d.display_id?.slice(0, 12) || d.label
+          : ""
+      );
+  }, [highlightedIds]);
+
+  /* toggle filter chip */
+  const toggleFilter = useCallback((label) => {
+    setActiveFilters((prev) => {
+      const next = new Set(prev);
+      next.has(label) ? next.delete(label) : next.add(label);
+      return next;
+    });
+  }, []);
+
+  /* label counts */
+  const labelCounts = {};
+  (graphData?.nodes || []).forEach((n) => {
+    labelCounts[n.label] = (labelCounts[n.label] || 0) + 1;
+  });
+  const presentLabels = NODE_TYPES.filter((l) => labelCounts[l]);
+
+  return (
+    <div className="graph-viewer" ref={containerRef}>
+      {/* Toolbar */}
+      <div className="graph-toolbar">
+        <button
+          className="graph-btn"
+          onClick={() => {
+            if (svgRef.current && zoomRef.current) {
+              d3.select(svgRef.current)
+                .transition()
+                .duration(500)
+                .call(zoomRef.current.transform, d3.zoomIdentity);
+            }
+          }}
+        >
+          ⤢ Minimize
+        </button>
+        <button
+          className={`graph-btn ${showOverlay ? "active" : ""}`}
+          onClick={() => setShowOverlay((v) => !v)}
+        >
+          🔲 {showOverlay ? "Hide" : "Show"} Granular Overlay
+        </button>
+      </div>
+
+      {/* Node-type filter chips */}
+      {showOverlay && (
+        <div className="node-type-filters">
+          {presentLabels.map((label) => (
+            <span
+              key={label}
+              className={`filter-chip ${activeFilters.has(label) ? "active" : ""}`}
+              style={{ background: getColor(label), color: "#333" }}
+              onClick={() => toggleFilter(label)}
+              title={`${labelCounts[label] || 0} nodes`}
+            >
+              {label.replace(/([A-Z])/g, " \$1").trim()}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* SVG canvas */}
+      <svg ref={svgRef} className="graph-canvas" />
+
+      {/* Loading overlay */}
+      {loading && (
+        <div className="graph-loading">
+          <div className="graph-spinner" />
+          <span className="graph-loading-text">Loading graph data...</span>
+        </div>
+      )}
+
+      {/* Tooltip */}
+      {tooltip && (
+        <NodeTooltip
+          node={tooltip.node}
+          x={tooltip.x}
+          y={tooltip.y}
+          connections={tooltip.connections}
+        />
+      )}
+
+      {/* Legend */}
+      {showOverlay && presentLabels.length > 0 && (
+        <div className="graph-legend">
+          <div className="legend-title">Node Types</div>
+          {presentLabels.slice(0, 8).map((label) => (
+            <div className="legend-item" key={label}>
+              <div
+                className="legend-dot"
+                style={{ background: getColor(label) }}
+              />
+              {label.replace(/([A-Z])/g, " \$1").trim()}
+            </div>
+          ))}
+          {presentLabels.length > 8 && (
+            <div className="legend-item" style={{ color: "#aaa" }}>
+              + {presentLabels.length - 8} more
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Stats bar */}
+      <div className="graph-stats-bar">
+        <strong>{(graphData?.nodes || []).length}</strong> nodes &nbsp;|&nbsp;
+        <strong>{(graphData?.edges || []).length}</strong> edges
+        {highlightedIds.size > 0 && (
+          <> &nbsp;|&nbsp; <strong style={{ color: "#f59e0b" }}>{highlightedIds.size}</strong> highlighted</>
+        )}
+      </div>
+    </div>
+  );
+});
+
+export default GraphViewer;
+frontend/src/App.css
+css
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+  background: #111;
+  color: #222;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
+.topbar {
+  height: 48px;
+  background: #1a1a2e;
+  display: flex;
+  align-items: center;
+  padding: 0 18px;
+  gap: 10px;
+  border-bottom: 1px solid #2a2a4a;
+  flex-shrink: 0;
+  z-index: 100;
+}
+
+.topbar-toggle {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s;
+}
+
+.topbar-toggle:hover {
+  color: #fff;
+}
+
+.topbar-separator {
+  color: #333;
+  font-size: 18px;
+  user-select: none;
+}
+
+.topbar-breadcrumb {
+  font-size: 13px;
+  color: #888;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.topbar-breadcrumb .crumb-active {
+  color: #e0e0e0;
+  font-weight: 600;
+}
+
+.topbar-breadcrumb .crumb-sep {
+  color: #444;
+}
+
+.topbar-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.topbar-action-btn {
+  background: #2a2a4a;
+  border: none;
+  color: #aaa;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.topbar-action-btn:hover {
+  background: #3a3a6a;
+  color: #fff;
+}
+
+/* ── Main layout ─────────────────────────────────────────────────────────── */
+.app-layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  background: #f8f9fb;
+}
+
+/* ── Graph layout ────────────────────────────────────────────────────────── */
+.graph-layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ── Notification toast ──────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1e3a5f;
+  color: #fff;
+  padding: 10px 22px;
+  border-radius: 8px;
+  font-size: 13px;
+  z-index: 9999;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  animation: toastIn 0.25s ease;
+}
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(12px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* ── Scrollbars ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #bbb; }
+frontend/src/App.jsx
+jsx
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+} from "react";
+import Sidebar     from "./components/Sidebar/Sidebar";
+import DataBrowser from "./components/DataBrowser/DataBrowser";
+import GraphViewer from "./components/GraphViewer/GraphViewer";
+import ChatPanel   from "./components/ChatPanel/ChatPanel";
+import { useGraph } from "./hooks/useGraph";
+import { useChat }  from "./hooks/useChat";
+import "./App.css";
+
+function Toast({ message, onDone }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 3000);
+    return () => clearTimeout(t);
+  }, [onDone]);
+  return <div className="toast">{message}</div>;
+}
+
+export default function App() {
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [activeView,       setActiveView]        = useState("browser"); // "browser" | "graph"
+  const [toast,            setToast]             = useState(null);
+
+  const graphRef = useRef(null);
+
+  const {
+    graphData,
+    loading:     graphLoading,
+    stats,
+    highlightedIds,
+    loadGraph,
+    loadStats,
+    highlightNodes,
+    clearHighlights,
+    loadNodeDetail,
+    setSelectedNode,
+  } = useGraph();
+
+  const {
+    messages,
+    loading: chatLoading,
+    sendMessage,
+    clearChat,
+  } = useChat();
+
+  /* load graph + stats when graph view is opened */
+  useEffect(() => {
+    if (activeView === "graph") {
+      loadGraph(400);
+      loadStats();
+    }
+  }, [activeView, loadGraph, loadStats]);
+
+  const handleNodeClick = useCallback(
+    (node) => {
+      loadNodeDetail(Number(node.id));
+      showToast(`Selected: ${node.label} — ${node.display_id}`);
+    },
+    [loadNodeDetail]
+  );
+
+  const handleSend = useCallback(
+    (text) => {
+      sendMessage(text, (highlights) => {
+        highlightNodes(highlights);
+        if (highlights.length > 0)
+          showToast(`Highlighted ${highlights.length} related node(s)`);
+      });
+    },
+    [sendMessage, highlightNodes]
+  );
+
+  const showToast = (msg) => setToast(msg);
+
+  const breadcrumbs =
+    activeView === "browser"
+      ? [{ label: "Mapping" }, { label: "Data Browser", active: true }]
+      : [{ label: "Mapping" }, { label: "Order to Cash", active: true }];
+
+  return (
+    <>
+      {/* ── Top bar ── */}
+      <div className="topbar">
+        <button
+          className="topbar-toggle"
+          onClick={() => setSidebarCollapsed((v) => !v)}
+          title="Toggle sidebar"
+        >
+          ☰
+        </button>
+        <span className="topbar-separator">|</span>
+        <div className="topbar-breadcrumb">
+          {breadcrumbs.map((b, i) => (
+            <React.Fragment key={i}>
+              {i > 0 && <span className="crumb-sep">/</span>}
+              <span className={b.active ? "crumb-active" : ""}>{b.label}</span>
+            </React.Fragment>
+          ))}
+        </div>
+        <div className="topbar-actions">
+          {activeView === "graph" && (
+            <>
+              <button
+                className="topbar-action-btn"
+                onClick={() => {
+                  clearHighlights();
+                  showToast("Highlights cleared");
+                }}
+              >
+                ✕ Clear Highlights
+              </button>
+              <button
+                className="topbar-action-btn"
+                onClick={() => graphRef.current?.resetZoom()}
+              >
+                ⤢ Fit Graph
+              </button>
+              <button
+                className="topbar-action-btn"
+                onClick={() => loadGraph(400)}
+              >
+                ↻ Reload
+              </button>
+            </>
+          )}
+          <button
+            className="topbar-action-btn"
+            onClick={() =>
+              setActiveView((v) => (v === "browser" ? "graph" : "browser"))
+            }
+          >
+            {activeView === "browser" ? "🕸 Graph View" : "🗂 Data Browser"}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Main layout ── */}
+      <div className="app-layout">
+        <Sidebar
+          activeView={activeView}
+          onViewChange={setActiveView}
+          collapsed={sidebarCollapsed}
+          stats={stats}
+        />
+
+        <div className="main-content">
+          {activeView === "browser" ? (
+            <DataBrowser onNavigateToGraph={() => setActiveView("graph")} />
+          ) : (
+            <div className="graph-layout">
+              <GraphViewer
+                ref={graphRef}
+                graphData={graphData}
+                loading={graphLoading}
+                highlightedIds={highlightedIds}
+                onNodeClick={handleNodeClick}
+              />
+              <ChatPanel
+                messages={messages}
+                loading={chatLoading}
+                onSend={handleSend}
+                onClear={clearChat}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Toast ── */}
+      {toast && (
+        <Toast message={toast} onDone={() => setToast(null)} />
+      )}
+    </>
+  );
+}
+frontend/src/index.js
+javascript
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./App.css";
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+docker-compose.yml
+yaml
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5.19-community
+    container_name: sap-o2c-neo4j
+    ports:
+      - "7474:7474"   # browser
+      - "7687:7687"   # bolt
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_memory_heap_initial__size: "512m"
+      NEO4J_dbms_memory_heap_max__size: "2g"
+      NEO4J_dbms_memory_pagecache_size: "512m"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    healthcheck:
+      test: ["CMD", "wget", "-O", "-", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sap-o2c-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sap-o2c-frontend
+    ports:
+      - "3000:80"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
+backend/Dockerfile
+dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+frontend/Dockerfile
+dockerfile
+# ── Build stage ──────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package.json ./
+RUN npm install --legacy-peer-deps
+
+COPY . .
+RUN npm run build
+
+# ── Production stage ─────────────────────────────────────────────────────────
+FROM nginx:alpine
+
+COPY --from=builder /app/build /usr/share/nginx/html
+
+# SPA routing — all 404s -> index.html
+RUN printf 'server {\n\
+  listen 80;\n\
+  root /usr/share/nginx/html;\n\
+  index index.html;\n\
+  location / {\n\
+    try_files $uri $uri/ /index.html;\n\
+  }\n\
+  gzip on;\n\
+  gzip_types text/plain text/css application/json application/javascript;\n\
+}\n' > /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+Quick-start guide
+1 — Install & run backend locally
+bash
+cd backend
+python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# copy and edit .env
+cp .env.example .env              # set OPENAI_API_KEY, NEO4J_* etc.
+
+uvicorn main:app --reload --port 8000
+2 — Install & run frontend locally
+bash
+cd frontend
+npm install --legacy-peer-deps
+# create .env
+echo "REACT_APP_API_URL=http://localhost:8000" > .env
+npm start
+3 — Start Neo4j (Docker)
+bash
+docker run -d \
+  --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/password \
+  -e NEO4J_PLUGINS='["apoc"]' \
+  neo4j:5.19-community
+4 — Ingest data
+Place your SAP CSV folders inside data/sap-o2c-data/ then either:
+
+bash
+# via API
+curl -X POST http://localhost:8000/api/ingestion/start
+
+# or click "⚡ Ingest to Graph" in the Data Browser UI
+5 — Docker Compose (everything at once)
+bash
+# put your OPENAI_API_KEY in backend/.env first
+docker-compose up --build
+# UI  → http://localhost:3000
+# API → http://localhost:8000/docs
+# Neo4j browser → http://localhost:7474
+What each piece does
+Layer	File	Responsibility
+Graph DB	neo4j_client.py	Async Neo4j driver, query runner
+Schema	schema.py	19 node types, 15+ relationships, indexes
+Ingestion	graph_builder.py	Batch-upserts all 19 CSV folders, builds all edges
+Guardrails	guardrails.py	Blocks off-topic prompts, dangerous Cypher, injection
+LLM Agent	agent.py	NL → Cypher → execute → NL answer, auto-fix retries
+Graph API	api/graph.py	Overview, node detail, search, stats
+Chat API	api/chat.py	Message handler, session management
+Ingestion API	api/ingestion.py	Background pipeline trigger + status polling
+GraphViewer	GraphViewer.jsx	D3 force graph, zoom, drag, highlight, tooltips
+ChatPanel	ChatPanel.jsx	Real-time chat, Cypher reveal, typing indicator
+DataBrowser	DataBrowser.jsx	File browser UI, ingest trigger, progress steps
+Hooks	useGraph.js / useChat.js	Stateful logic separated from UI
+Claude Sonnet 4.6
+make one readme file explaining everything done and how it is working and what each file has
+
+
+Thought Process
+expand
+The user wants a comprehensive README.md file that explains the entire project, how it works, and what each file contains.
+
+README.md
+markdown
+# SAP Order-to-Cash Graph Intelligence Platform
+
+A full-stack graph intelligence system that ingests SAP Order-to-Cash (O2C)
+data into a Neo4j graph database, visualises it as an interactive force-directed
+graph, and lets you query it in plain English through an LLM-powered chat agent.
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Architecture Diagram](#2-architecture-diagram)
+3. [Tech Stack](#3-tech-stack)
+4. [Repository Structure](#4-repository-structure)
+5. [Backend — File-by-File](#5-backend--file-by-file)
+   - 5.1 [main.py](#51-mainpy)
+   - 5.2 [config.py](#52-configpy)
+   - 5.3 [database/neo4j_client.py](#53-databaseneo4j_clientpy)
+   - 5.4 [database/schema.py](#54-databaseschemapy)
+   - 5.5 [ingestion/data_loader.py](#55-ingestiondata_loaderpy)
+   - 5.6 [ingestion/graph_builder.py](#56-ingestiongraph_builderpy)
+   - 5.7 [llm/prompts.py](#57-llmpromptspy)
+   - 5.8 [llm/guardrails.py](#58-llmguardrailspy)
+   - 5.9 [llm/agent.py](#59-llmagentpy)
+   - 5.10 [api/graph.py](#510-apigraphpy)
+   - 5.11 [api/chat.py](#511-apichatpy)
+   - 5.12 [api/ingestion.py](#512-apiingestionpy)
+   - 5.13 [models/schemas.py](#513-modelsschemaspyy)
+6. [Frontend — File-by-File](#6-frontend--file-by-file)
+   - 6.1 [src/index.js](#61-srcindexjs)
+   - 6.2 [src/App.jsx](#62-srcappjsx)
+   - 6.3 [src/App.css](#63-srcappcss)
+   - 6.4 [src/services/api.js](#64-srcservicesapijs)
+   - 6.5 [src/hooks/useGraph.js](#65-srchooksusegraphjs)
+   - 6.6 [src/hooks/useChat.js](#66-srchooksusechatjs)
+   - 6.7 [src/components/Sidebar](#67-srccomponentssidebar)
+   - 6.8 [src/components/DataBrowser](#68-srccomponentsdatabrowser)
+   - 6.9 [src/components/GraphViewer](#69-srccomponentsgraphviewer)
+   - 6.10 [src/components/ChatPanel](#610-srccomponentschatpanel)
+   - 6.11 [src/components/NodeTooltip](#611-srccomponentsnodetooltip)
+7. [Graph Data Model](#7-graph-data-model)
+   - 7.1 [Node Types](#71-node-types)
+   - 7.2 [Relationships](#72-relationships)
+8. [LLM Integration](#8-llm-integration)
+   - 8.1 [How Natural Language Becomes a Cypher Query](#81-how-natural-language-becomes-a-cypher-query)
+   - 8.2 [Guardrails System](#82-guardrails-system)
+   - 8.3 [Session Memory](#83-session-memory)
+9. [Data Ingestion Pipeline](#9-data-ingestion-pipeline)
+10. [API Reference](#10-api-reference)
+11. [Environment Variables](#11-environment-variables)
+12. [Running Locally](#12-running-locally)
+    - 12.1 [Prerequisites](#121-prerequisites)
+    - 12.2 [Neo4j](#122-neo4j)
+    - 12.3 [Backend](#123-backend)
+    - 12.4 [Frontend](#124-frontend)
+13. [Running with Docker Compose](#13-running-with-docker-compose)
+14. [Placing Your Data](#14-placing-your-data)
+15. [How the Graph Visualisation Works](#15-how-the-graph-visualisation-works)
+16. [Evaluation Criteria Map](#16-evaluation-criteria-map)
+17. [Troubleshooting](#17-troubleshooting)
+18. [Extending the System](#18-extending-the-system)
+
+---
+
+## 1. Project Overview
+
+The SAP Order-to-Cash (O2C) process spans many documents and systems:
+a customer places a sales order → goods are picked and delivered →
+an invoice (billing document) is raised → accounting entries are posted →
+payment is received and matched.
+
+This platform:
+
+- **Ingests** all 19 SAP O2C CSV data folders into Neo4j, modelling every
+  document as a node and every business relationship as a graph edge.
+- **Visualises** the resulting graph as an interactive, filterable,
+  force-directed diagram built with D3.js.
+- **Enables plain-English queries** through a chat panel powered by GPT-4o,
+  which translates questions into Cypher queries, executes them, and returns
+  business-language answers.
+- **Highlights** relevant nodes in the graph in real time as the agent answers
+  each question.
+- **Guards** against misuse through a multi-layer guardrail system that blocks
+  off-topic prompts, dangerous Cypher, and prompt-injection attempts.
+
+---
+
+## 2. Architecture Diagram
+┌─────────────────────────────────────────────────────────────────┐
+│ Browser (React) │
+│ │
+│ ┌──────────┐ ┌──────────────────────┐ ┌───────────────┐ │
+│ │ Sidebar │ │ GraphViewer (D3) │ │ ChatPanel │ │
+│ │ DataBrow-│ │ force simulation │ │ (messages, │ │
+│ │ ser │ │ node tooltips │ │ cypher │ │
+│ │ │ │ highlight overlay │ │ reveal) │ │
+│ └────┬─────┘ └──────────┬───────────┘ └──────┬────────┘ │
+│ │ │ useGraph() │ useChat() │
+└───────┼────────────────────┼───────────────────────┼───────────┘
+│ │ HTTP / REST │
+▼ ▼ ▼
+┌───────────────────────────────────────────────────────────────┐
+│ FastAPI Backend (Python) │
+│ │
+│ /api/folders /api/graph/* /api/chat/message │
+│ /api/ingestion/* │
+│ │
+│ ┌──────────────┐ ┌───────────────┐ ┌──────────────────┐ │
+│ │IngestionAPI │ │ GraphAPI │ │ ChatAPI │ │
+│ │ (background │ │ (overview, │ │ (GraphAgent, │ │
+│ │ pipeline) │ │ node detail, │ │ guardrails, │ │
+│ │ │ │ search,stats)│ │ prompts) │ │
+│ └──────┬───────┘ └──────┬────────┘ └──────┬───────────┘ │
+│ │ │ │ │
+│ ┌──────▼─────────────────▼───────────────────▼───────────┐ │
+│ │ Neo4j Async Driver │ │
+│ └──────────────────────────┬──────────────────────────────┘ │
+└─────────────────────────────┼──────────────────────────────────┘
+│ Bolt protocol
+▼
+┌──────────────────┐
+│ Neo4j 5.x │
+│ Graph Database │
+│ 19 node labels │
+│ 15+ rel types │
+└──────────────────┘
+▲
+┌─────────┴────────┐
+│ OpenAI GPT-4o │
+│ (Cypher gen + │
+│ NL answers) │
+└──────────────────┘
+
+text
+
+---
+
+## 3. Tech Stack
+
+| Layer | Technology | Why |
+|---|---|---|
+| Graph DB | Neo4j 5.x (Community) | Native graph storage, Cypher query language, APOC plugins |
+| Backend framework | FastAPI (Python 3.11) | Async-first, automatic OpenAPI docs, Pydantic validation |
+| Neo4j driver | neo4j-driver (async) | Official async Python driver for Neo4j |
+| LLM | OpenAI GPT-4o | Best-in-class instruction following for Cypher generation |
+| Data processing | Pandas | CSV/Parquet loading and cleaning |
+| Frontend framework | React 18 | Component model, hooks, concurrent rendering |
+| Graph visualisation | D3.js v7 | Force simulation, zoom, drag — full low-level control |
+| HTTP client | Axios | Promise-based, interceptor support |
+| Containerisation | Docker + Compose | One-command startup |
+| Retry logic | Tenacity | Automatic LLM call retries with exponential back-off |
+
+---
+
+## 4. Repository Structure
+sap-o2c-graph/
+│
+├── backend/ # Python FastAPI service
+│ ├── main.py # App entry point, routers, lifespan
+│ ├── config.py # Pydantic settings from .env
+│ ├── requirements.txt # Python dependencies
+│ ├── Dockerfile # Backend container
+│ ├── .env # Secrets (not committed)
+│ │
+│ ├── database/
+│ │ ├── init.py
+│ │ ├── neo4j_client.py # Async driver singleton + query helpers
+│ │ └── schema.py # Node/relationship definitions, index DDL
+│ │
+│ ├── ingestion/
+│ │ ├── init.py
+│ │ ├── data_loader.py # CSV/Parquet → Pandas DataFrame
+│ │ └── graph_builder.py # DataFrame → Neo4j nodes & edges
+│ │
+│ ├── api/
+│ │ ├── init.py
+│ │ ├── graph.py # REST endpoints for graph data
+│ │ ├── chat.py # REST endpoints for LLM chat
+│ │ └── ingestion.py # REST endpoints for pipeline control
+│ │
+│ ├── llm/
+│ │ ├── init.py
+│ │ ├── prompts.py # All prompt templates
+│ │ ├── guardrails.py # Safety filters
+│ │ └── agent.py # GraphAgent class (NL→Cypher→answer)
+│ │
+│ └── models/
+│ ├── init.py
+│ └── schemas.py # Pydantic request/response models
+│
+├── frontend/ # React application
+│ ├── public/
+│ │ └── index.html # HTML shell
+│ ├── Dockerfile # Multi-stage build → nginx
+│ ├── package.json
+│ ├── .env # REACT_APP_API_URL
+│ │
+│ └── src/
+│ ├── index.js # ReactDOM root mount
+│ ├── App.jsx # Root component, view routing, layout
+│ ├── App.css # Global styles, topbar, layout grid
+│ │
+│ ├── services/
+│ │ └── api.js # All Axios calls in one place
+│ │
+│ ├── hooks/
+│ │ ├── useGraph.js # Graph state + D3 data management
+│ │ └── useChat.js # Chat state + session management
+│ │
+│ └── components/
+│ ├── Sidebar/
+│ │ ├── Sidebar.jsx # Collapsible nav + live stats
+│ │ └── Sidebar.css
+│ ├── DataBrowser/
+│ │ ├── DataBrowser.jsx # File browser + ingestion controls
+│ │ └── DataBrowser.css
+│ ├── GraphViewer/
+│ │ ├── GraphViewer.jsx # D3 force graph canvas
+│ │ └── GraphViewer.css
+│ ├── ChatPanel/
+│ │ ├── ChatPanel.jsx # Chat UI + Cypher reveal
+│ │ └── ChatPanel.css
+│ └── NodeTooltip/
+│ ├── NodeTooltip.jsx # Node property popup
+│ └── NodeTooltip.css
+│
+├── data/
+│ └── sap-o2c-data/ # ← place CSV folders here
+│ ├── sales_order_headers/
+│ ├── sales_order_items/
+│ └── ... (19 folders total)
+│
+└── docker-compose.yml # Neo4j + backend + frontend
+
+text
+
+---
+
+## 5. Backend — File-by-File
+
+### 5.1 `main.py`
+
+**What it does**
+
+The application entry point. Creates the FastAPI app, registers all three
+routers, configures CORS and GZip middleware, and manages the Neo4j driver
+lifecycle through a lifespan context manager (connects on startup, disconnects
+on shutdown). Also exposes a `/api/folders` endpoint that lists the data
+directory contents so the front-end Data Browser can display real file
+metadata.
+
+**Key details**
+
+- `lifespan` async context manager ensures clean DB connection teardown even if
+  the server is killed with SIGTERM.
+- `GZipMiddleware` compresses API responses larger than 1 KB — important when
+  the graph overview returns hundreds of nodes.
+- `CORSMiddleware` reads allowed origins from settings so the same binary works
+  in local dev (`localhost:3000`) and production.
+
+---
+
+### 5.2 `config.py`
+
+**What it does**
+
+Centralises every configurable value using `pydantic-settings`. Values are read
+from environment variables or a `.env` file. The `@lru_cache` decorator ensures
+the settings object is created only once no matter how many modules import it.
+
+**Settings**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt connection string |
+| `NEO4J_USER` | `neo4j` | Database username |
+| `NEO4J_PASSWORD` | `password` | Database password |
+| `OPENAI_API_KEY` | _(required)_ | Your OpenAI secret key |
+| `OPENAI_MODEL` | `gpt-4o` | Model used for Cypher generation and answers |
+| `DATA_DIR` | `./data/sap-o2c-data` | Root folder containing the 19 CSV subfolders |
+| `CORS_ORIGINS` | `["http://localhost:3000"]` | Allowed browser origins |
+
+---
+
+### 5.3 `database/neo4j_client.py`
+
+**What it does**
+
+Manages a single shared async Neo4j driver instance (singleton pattern).
+Provides two helper functions:
+
+- `run_query(cypher, params)` — executes a read query and returns a list of
+  dictionaries.
+- `run_write_query(cypher, params)` — executes a write query and returns the
+  result summary (counters, etc.).
+
+**Why a singleton?**
+  
+The Neo4j async driver maintains an internal connection pool. Creating a new
+driver per request would exhaust TCP sockets under load. The singleton is
+created once at startup and reused for all requests.
+
+---
+
+### 5.4 `database/schema.py`
+
+**What it does**
+
+Two things:
+
+1. **`SCHEMA_INDEXES`** — a list of Cypher `CREATE INDEX` statements run once
+   during startup ingestion. Indexes are created on the primary identifier
+   property of each node label (e.g. `SalesOrder.SalesOrder`,
+   `BillingDocument.BillingDocument`). Without these, every node lookup is a
+   full scan.
+
+2. **`SCHEMA_DESCRIPTION`** — a multi-line string injected into every LLM
+   prompt. It tells GPT-4o the exact node labels, their key properties, and
+   the available relationship types so the model generates correct Cypher
+   without hallucinating field names.
+
+**Node labels defined (19 total)**
+SalesOrder · SalesOrderItem · SalesOrderScheduleLine
+OutboundDelivery · OutboundDeliveryItem
+BillingDocument · BillingDocumentItem · BillingCancellation
+JournalEntry · Payment
+BusinessPartner · BusinessPartnerAddress · CustomerCompany · CustomerSalesArea
+Product · ProductDescription · ProductPlant · ProductStorageLocation · Plant
+
+text
+
+---
+
+### 5.5 `ingestion/data_loader.py`
+
+**What it does**
+
+Provides generic utilities to turn files on disk into clean Python lists of
+dictionaries:
+
+- `load_csv_folder(folder_name)` — recursively finds all `.csv` and `.parquet`
+  files in a named subfolder of `DATA_DIR`, loads each one with Pandas, and
+  concatenates them into a single DataFrame.
+- `clean_row(row)` — converts `NaN` values to `None` so they become JSON `null`
+  rather than the string `"nan"` when sent to Neo4j.
+- `df_to_records(df)` — calls `clean_row` on every row and returns a plain
+  Python list of dicts.
+
+**Why Pandas?**
+
+SAP exports are often multiple part-files per entity (Parquet partitions or
+CSV chunks). Pandas handles both formats, concats them automatically, and
+provides the `NaN` semantics needed for clean graph writes.
+
+---
+
+### 5.6 `ingestion/graph_builder.py`
+
+**What it does**
+
+Orchestrates the full ingestion pipeline. Contains one loader function per
+SAP entity (19 in total) plus relationship-wiring functions. Everything is
+batched in groups of 500 rows using `UNWIND … MERGE` Cypher so large datasets
+don't create thousands of individual round-trips.
+
+**Key design decisions**
+
+| Decision | Reason |
+|---|---|
+| `MERGE` instead of `CREATE` | Idempotent — re-running ingestion updates existing nodes rather than duplicating them |
+| Composite key properties | SAP items need compound keys (`SalesOrder + SalesOrderItem`), so a synthetic `_Key` property is constructed before upserting |
+| Two-pass relationship creation | Nodes are all created first; then relationship queries `MATCH` both ends. This avoids ordering problems where side A exists but side B hasn't been loaded yet |
+| Batch size 500 | Balances transaction size against memory pressure in Neo4j |
+| Background task | The full pipeline runs in a FastAPI `BackgroundTasks` callback so the HTTP response returns immediately with a "started" status |
+
+**Ingestion order**
+SalesOrders 11. Plants
+SalesOrderItems 12. Products
+SalesOrderSchedules 13. ProductDescriptions
+BusinessPartners 14. ProductPlants
+BPAddresses 15. ProductStorageLocations
+CustomerCompany 16. OutboundDeliveries
+CustomerSalesArea 17. OutboundDeliveryItems
+(schema indexes) 18. BillingDocuments
+JournalEntries 19. BillingDocumentItems
+Payments 20. BillingCancellations
+21. Link SO → BusinessPartner
+text
+
+---
+
+### 5.7 `llm/prompts.py`
+
+**What it does**
+
+Stores every prompt template as a module-level constant. No prompt strings
+appear anywhere else in the codebase — all modifications to LLM behaviour are
+made here.
+
+**Templates**
+
+| Constant | Used for |
+|---|---|
+| `SYSTEM_PROMPT` | Injected as the system message in every OpenAI call. Describes Dodge AI's persona, capabilities, rules, and the full schema |
+| `CYPHER_GENERATION_PROMPT` | Asks GPT-4o to translate a user question into a JSON object containing a Cypher query and an explanation |
+| `ANSWER_GENERATION_PROMPT` | Given the executed query results, asks GPT-4o to produce a business-language answer |
+| `HIGHLIGHT_PROMPT` | (utility) Asks GPT-4o to identify which result nodes should be highlighted in the graph |
+
+---
+
+### 5.8 `llm/guardrails.py`
+
+**What it does**
+
+Provides three independent safety functions that are called at different points
+in the request lifecycle.
+
+**Layer 1 — `check_message_safety(message)`**
+
+Called before any LLM API call. Checks the raw user message against:
+
+- **Blocked regex patterns** — passwords, API keys, credit card numbers,
+  jailbreak phrases, weather, jokes, sports and other clearly off-topic
+  domains.
+- **Topic relevance check** — for messages longer than five words, at least
+  one word must match a list of ~40 O2C-related keywords (order, billing,
+  invoice, delivery, plant, journal, etc.). Messages with no relevant terms
+  are politely redirected.
+
+Returns `(is_safe: bool, reason: str)`.
+
+**Layer 2 — `validate_cypher_query(cypher)`**
+
+Called after the LLM generates a Cypher query, before execution. Blocks:
+
+- `DELETE`, `DETACH DELETE`, `DROP`
+- `CREATE USER`, `CREATE DATABASE`
+- `SET PASSWORD`, `CALL dbms.*`
+- Any query that doesn't contain at least one of `MATCH`, `RETURN`, `WITH`,
+  `CALL`, `UNWIND` (ensures it is a read or safe aggregation query).
+
+**Layer 3 — `sanitize_cypher_limit(cypher, max_limit=500)`**
+
+Appends `LIMIT 500` to any query that doesn't already have a `LIMIT` clause.
+Prevents a `MATCH (n) RETURN n` from returning the entire database.
+
+---
+
+### 5.9 `llm/agent.py`
+
+**What it does**
+
+Contains the `GraphAgent` class — the core intelligence of the platform.
+
+**Full request lifecycle**
+User message
+│
+▼
+check_message_safety() ← guardrail layer 1
+│ safe
+▼
+_generate_cypher() ← GPT-4o call 1
+└─ CYPHER_GENERATION_PROMPT
+└─ returns {cypher, explanation}
+│
+▼
+validate_cypher_query() ← guardrail layer 2
+sanitize_cypher_limit() ← guardrail layer 3
+│
+▼
+run_query(cypher) ← Neo4j execution
+│ on error → auto-fix retry (GPT-4o call 1b)
+▼
+_generate_answer() ← GPT-4o call 2
+└─ ANSWER_GENERATION_PROMPT
+└─ last 3 exchanges from history injected for context
+│
+▼
+_extract_highlight_ids() ← maps result props → graph node IDs
+│
+▼
+return {answer, cypher, results, highlights}
+
+text
+
+**Session management**
+
+Each browser tab gets a UUID session ID. `get_agent(session_id)` returns the
+same `GraphAgent` instance for that session, preserving `conversation_history`
+(last 6 messages = 3 exchanges) across turns. Sessions are stored in a
+module-level dict `_agents`.
+
+**Retry logic**
+
+`_call_llm` is decorated with `@retry(stop_after_attempt(3), wait_exponential)`
+from Tenacity. If the OpenAI API returns a rate-limit or transient error, it
+waits 1→2→4 seconds and retries automatically.
+
+---
+
+### 5.10 `api/graph.py`
+
+**What it does**
+
+Exposes four REST endpoints consumed by the React frontend.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/graph/overview` | GET | Returns up to `limit` nodes (filtered by label if `node_types` param provided) plus all edges between them. Powers the D3 visualisation. |
+| `/api/graph/node/{id}` | GET | Returns full properties + up to 10 neighbouring nodes for the clicked node. Powers the `NodeTooltip` connection count. |
+| `/api/graph/search` | GET | Full-text search across all node properties using `toLower(toString(...)) CONTAINS`. Powers the search bar. |
+| `/api/graph/stats` | GET | Returns per-label node counts and per-type relationship counts. Uses APOC if available, falls back to manual aggregation. Powers the sidebar stats. |
+
+**Node serialisation**
+
+All Neo4j internal node IDs are converted to strings (JavaScript cannot safely
+handle Neo4j's 64-bit integers). Properties containing `None` are preserved as
+JSON `null`. A `display_id` field is synthesised by checking known identifier
+properties in order (`SalesOrder`, `BillingDocument`, `AccountingDocument`,
+etc.) so the graph visualisation shows meaningful labels.
+
+---
+
+### 5.11 `api/chat.py`
+
+**What it does**
+
+Three endpoints:
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/chat/message` | POST | Accepts `{message, session_id}`, calls `GraphAgent.chat()`, returns `{answer, cypher, results, highlights}` |
+| `/api/chat/session/{id}` | DELETE | Removes the agent from the session store, resetting conversation history |
+| `/api/chat/history/{id}` | GET | Returns the raw OpenAI message history for a session (useful for debugging) |
+
+---
+
+### 5.12 `api/ingestion.py`
+
+**What it does**
+
+Controls the data ingestion pipeline.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/ingestion/start` | POST | Starts `run_full_ingestion()` as a background task. Returns 409 if already running. |
+| `/api/ingestion/status` | GET | Returns `{status, steps, message}`. The frontend polls this every 2 seconds while running. `status` is one of: `idle`, `running`, `completed`, `error` |
+| `/api/ingestion/reset` | POST | Runs `MATCH (n) DETACH DELETE n` in transactions of 1000 rows to wipe the graph. |
+
+**Status tracking**
+
+A module-level dict `_ingestion_status` is mutated by the background task as
+each step completes. Each step records `{step: "name", status: "success"|"error",
+error: "..."}`. The frontend renders these as colour-coded badges.
+
+---
+
+### 5.13 `models/schemas.py`
+
+**What it does**
+
+Defines all Pydantic v2 models used as request bodies and response models.
+Pydantic validates types automatically — if a client sends wrong data FastAPI
+returns a 422 with a clear error message before any business logic runs.
+
+| Model | Used for |
+|---|---|
+| `ChatMessage` | POST `/api/chat/message` request body. Validates `message` is 1–2000 chars. |
+| `ChatResponse` | Chat endpoint response. Includes `answer`, optional `cypher`, `results` list, `highlights` list. |
+| `GraphData` | Graph overview response. Contains `nodes`, `edges`, counts. |
+| `GraphNode` | Individual node representation. |
+| `GraphEdge` | Individual edge representation. |
+| `IngestionStatus` | Ingestion status response with step list. |
+| `NodeSearchResult` | Search results response. |
+
+---
+
+## 6. Frontend — File-by-File
+
+### 6.1 `src/index.js`
+
+The React entry point. Creates a root with `ReactDOM.createRoot` (React 18
+concurrent mode) and renders `<App />` wrapped in `<StrictMode>`.
+
+---
+
+### 6.2 `src/App.jsx`
+
+**What it does**
+
+The root component. Owns all top-level state:
+
+- `activeView` — `"browser"` or `"graph"`, determines which panel is shown.
+- `sidebarCollapsed` — whether the sidebar is hidden.
+- `toast` — the current notification message.
+
+Wires `useGraph` and `useChat` hooks together:
+when the chat agent highlights nodes, `highlightNodes()` from `useGraph`
+is called. When a user types a message, `sendMessage()` from `useChat` is
+called with a callback that triggers the highlight.
+
+Renders the topbar with contextual action buttons (different buttons appear
+in browser view vs. graph view), the `<Sidebar>`, and either
+`<DataBrowser>` or the graph+chat split layout.
+
+---
+
+### 6.3 `src/App.css`
+
+Global styles:
+
+- CSS reset (`box-sizing`, zero margin/padding).
+- `body` — dark background, Inter font, 100vh, no overflow.
+- `.topbar` — 48px dark header with flex layout.
+- `.app-layout` — horizontal flex container for sidebar + content.
+- `.graph-layout` — flex row containing `GraphViewer` (flex:1) and `ChatPanel`.
+- `.toast` — fixed bottom-centre notification with slide-up animation.
+- Custom scrollbar styling for WebKit browsers.
+
+---
+
+### 6.4 `src/services/api.js`
+
+**What it does**
+
+Single Axios instance with `baseURL` from `REACT_APP_API_URL` and a 60-second
+timeout (LLM calls can be slow). All API calls live here — no other file
+imports Axios directly. Error interceptor logs to the console.
+
+**Exported functions**
+
+| Function | HTTP | Endpoint |
+|---|---|---|
+| `fetchGraphOverview(limit, nodeTypes)` | GET | `/api/graph/overview` |
+| `fetchNodeDetail(nodeId)` | GET | `/api/graph/node/:id` |
+| `searchNodes(q, label, limit)` | GET | `/api/graph/search` |
+| `fetchGraphStats()` | GET | `/api/graph/stats` |
+| `sendChatMessage(message, sessionId)` | POST | `/api/chat/message` |
+| `clearChatSession(sessionId)` | DELETE | `/api/chat/session/:id` |
+| `startIngestion()` | POST | `/api/ingestion/start` |
+| `getIngestionStatus()` | GET | `/api/ingestion/status` |
+| `resetGraph()` | POST | `/api/ingestion/reset` |
+| `listFolders()` | GET | `/api/folders` |
+
+---
+
+### 6.5 `src/hooks/useGraph.js`
+
+**What it does**
+
+Encapsulates all graph-related state and actions. Used by `App.jsx` to keep
+the root component clean.
+
+**State**
+
+| State | Type | Description |
+|---|---|---|
+| `graphData` | `{nodes[], edges[]}` | Raw graph data from the API |
+| `selectedNode` | `object \| null` | Currently clicked node with detail data |
+| `highlightedIds` | `Set<string>` | Node IDs to highlight in D3 |
+| `loading` | `boolean` | True while fetching graph data |
+| `stats` | `object \| null` | Node/edge counts for sidebar |
+| `error` | `string \| null` | Last error message |
+
+**Actions**
+
+- `loadGraph(limit, nodeTypes)` — fetches overview from API and sets
+  `graphData`.
+- `loadNodeDetail(nodeId)` — fetches node detail and sets `selectedNode`.
+- `loadStats()` — fetches graph stats and sets `stats`.
+- `highlightNodes(highlights)` — maps chat agent highlight descriptors
+  `[{label, properties}]` to actual node IDs by checking `graphData.nodes`
+  for property matches, then sets `highlightedIds`.
+- `clearHighlights()` — empties `highlightedIds`.
+
+---
+
+### 6.6 `src/hooks/useChat.js`
+
+**What it does**
+
+Encapsulates all chat state. Each hook instance creates a unique session UUID
+on mount using `useRef(uuidv4())` so it persists across re-renders without
+triggering effects.
+
+**State**
+
+| State | Type | Description |
+|---|---|---|
+| `messages` | `Message[]` | Full conversation history for display |
+| `loading` | `boolean` | True while waiting for API response |
+| `lastQueryResult` | `object \| null` | The last full API response (includes results array) |
+
+**Actions**
+
+- `sendMessage(text, onHighlight)` — appends a user message, calls the API,
+  appends the assistant reply, and invokes `onHighlight(highlights)` callback
+  if the agent returned highlight data.
+- `clearChat()` — calls the delete session endpoint on the backend, creates a
+  new UUID, and resets messages to just the welcome message.
+
+---
+
+### 6.7 `src/components/Sidebar`
+
+**Sidebar.jsx**
+
+Collapsible left navigation panel. Two nav items: Data Browser and Graph View.
+When the `stats` prop is provided (from `useGraph`), shows a live count table
+of up to 6 node types at the bottom. Width transitions with CSS for a smooth
+collapse animation.
+
+**Sidebar.css**
+
+Dark theme (`#1a1a2e` background) matching the topbar. Active nav items get a
+blue background. Stats section docked to the bottom with `margin-top: auto`.
+
+---
+
+### 6.8 `src/components/DataBrowser`
+
+**DataBrowser.jsx**
+
+Shows all 19 SAP data folders in a table with columns: icon, name, file count,
+last modified date, total size. Includes:
+
+- A search input that filters folders by name in real time.
+- An **⚡ Ingest to Graph** button that calls `/api/ingestion/start` and starts
+  polling `/api/ingestion/status` every 2 seconds.
+- A status bar that turns yellow (running), green (completed), or red (error).
+- A badge strip showing every pipeline step with a ✓ or ✗ indicator.
+- If the backend's `/api/folders` endpoint is unavailable (e.g. data not
+  mounted), falls back to a static list of the 19 known folder names.
+
+**DataBrowser.css**
+
+Light theme matching a file-browser aesthetic. Sticky table headers.
+Folder names are blue and underlined on hover. The ingest button pulses
+with a CSS animation while running.
+
+---
+
+### 6.9 `src/components/GraphViewer`
+
+**GraphViewer.jsx**
+
+The most complex component. Renders an interactive D3 force-directed graph
+inside an SVG element that fills its container.
+
+**How it works step by step**
+
+1. **Resize observer** — A `ResizeObserver` on the container div tracks width
+   and height. When dimensions change, the D3 simulation is rebuilt at the
+   new size.
+
+2. **Data filtering** — Before building the simulation, nodes are filtered by
+   the active filter chips (node type toggles). Edges whose endpoints are no
+   longer visible are also removed.
+
+3. **SVG construction** — A `<g>` group is appended and a D3 zoom behaviour is
+   attached to the SVG. All graph elements go inside the group so zoom/pan
+   affects them uniformly.
+
+4. **Arrowhead marker** — A `<defs>/<marker>` element adds a small arrowhead
+   at the target end of every edge line.
+
+5. **Force simulation** — Five forces:
+   - `forceLink` — pulls connected nodes toward each other (distance 60px).
+   - `forceManyBody` — repels all nodes (strength −120, max distance 300px).
+   - `forceCenter` — keeps the cluster centred in the viewport.
+   - `forceCollide` — prevents node overlap.
+   - `alphaDecay 0.025` — slower cooling for a more spread-out layout.
+
+6. **Tick handler** — On every simulation tick, `line` x1/y1/x2/y2 and `g`
+   `transform` attributes are updated to move nodes and edges.
+
+7. **Drag behaviour** — `d3.drag` allows individual nodes to be pinned and
+   repositioned. Dragging restarts the simulation with `alphaTarget(0.3)`.
+
+8. **Tooltips** — `mouseover`/`mousemove`/`mouseout` events on node groups
+   update `tooltip` React state, which renders `<NodeTooltip>` at the pointer
+   position.
+
+9. **Highlights** — A `useEffect` watching `highlightedIds` updates circle
+   stroke colour (amber), stroke width, and radius in place without rebuilding
+   the simulation. Text labels appear only for highlighted nodes.
+
+10. **Auto-fit zoom** — After the simulation ends (`sim.on("end", ...)`) the
+    bounding box of all nodes is calculated and a zoom transform is computed
+    to fit the graph into the viewport with 40px padding.
+
+11. **`useImperativeHandle`** — Exposes `resetZoom()` to the parent via a ref
+    so the "⤢ Fit Graph" topbar button can trigger a zoom reset.
+
+**GraphViewer.css**
+
+SVG cursor is `grab`. Node circles transition radius on hover. Legend and stats
+bar are absolutely positioned over the canvas with a frosted-glass effect
+(`backdrop-filter: blur`).
+
+---
+
+### 6.10 `src/components/ChatPanel`
+
+**ChatPanel.jsx**
+
+A self-contained chat interface on the right side of the graph view.
+
+**Structure**
+┌─────────────────────────────┐
+│ Chat with Graph │ ← header
+│ Order to Cash │
+├─────────────────────────────┤
+│ [D] Dodge AI │ ← agent identity bar
+│ Graph Agent [Clear] │
+├─────────────────────────────┤
+│ │
+│ Hi! I can help you... │ ← messages scroll area
+│ │
+│ [You] ▶ │
+│ [D] The journal entry... │
+│ ▼ Show Cypher query │
+│ ┌──────────────────────┐ │
+│ │ MATCH (j:JournalEntry│ │ ← expandable Cypher block
+│ │ ... │ │
+│ └──────────────────────┘ │
+├─────────────────────────────┤
+│ ● Dodge AI is awaiting... │ ← status bar
+├─────────────────────────────┤
+│ [textarea] [Send] │ ← input row
+└─────────────────────────────┘
+
+text
+
+**Features**
+
+- Markdown bold (`**text**`) and inline code rendered via regex replacement.
+- Cypher queries hidden by default; a toggle link expands a monospace dark
+  block showing the raw Cypher.
+- Typing indicator (three bouncing dots) shown while `loading` is true.
+- `Enter` sends, `Shift+Enter` inserts newline.
+- Scroll-to-bottom via `scrollIntoView` on every message update.
+- Auto-focus textarea after each send.
+
+---
+
+### 6.11 `src/components/NodeTooltip`
+
+**NodeTooltip.jsx**
+
+An absolutely-positioned overlay rendered inside `GraphViewer` when the mouse
+hovers over a node. Shows up to 14 node properties sorted by business
+importance (primary document IDs first, then amounts, dates, and codes).
+If there are more than 14 properties, a "Additional N fields hidden for
+readability" message is shown. Connection count is shown at the bottom.
+
+Position is clamped to `window.innerWidth − 380` and `window.innerHeight − 400`
+so the tooltip never overflows the viewport edge.
+
+**Priority sort order**
+SalesOrder · BillingDocument · OutboundDelivery · AccountingDocument
+PaymentDocument · BusinessPartner · Product · Plant · CompanyCode
+FiscalYear · GlAccount · AmountInTransactionCurrency · TransactionCurrency
+PostingDate · DocumentDate · ReferenceDocument
+
+text
+
+---
+
+## 7. Graph Data Model
+
+### 7.1 Node Types
+
+| Label | Key Property | Source Folder | Description |
+|---|---|---|---|
+| `SalesOrder` | `SalesOrder` | `sales_order_headers` | Sales order header document |
+| `SalesOrderItem` | `SalesOrderItem_Key` | `sales_order_items` | Individual line item on a sales order |
+| `SalesOrderScheduleLine` | `SalesOrderScheduleLine_Key` | `sales_order_schedule_lines` | Planned delivery schedule for an item |
+| `OutboundDelivery` | `OutboundDelivery` | `outbound_delivery_headers` | Physical delivery (shipping) document |
+| `OutboundDeliveryItem` | `OutboundDeliveryItem_Key` | `outbound_delivery_items` | Item within a delivery |
+| `BillingDocument` | `BillingDocument` | `billing_document_headers` | Invoice raised to the customer |
+| `BillingDocumentItem` | `BillingDocumentItem_Key` | `billing_document_items` | Invoice line item |
+| `BillingCancellation` | `CancelledBillingDocument` | `billing_document_cancellations` | Reversal of a billing document |
+| `JournalEntry` | `JournalEntry_Key` | `journal_entry_items_accounts_receivable` | Accounting posting in the AR ledger |
+| `Payment` | `Payment_Key` | `payments_accounts_receivable` | AR payment receipt |
+| `BusinessPartner` | `BusinessPartner` | `business_partners` | Customer/vendor master record |
+| `BusinessPartnerAddress` | `BusinessPartnerAddress_Key` | `business_partner_addresses` | Street/postal address for a partner |
+| `CustomerCompany` | `CustomerCompany_Key` | `customer_company_assignments` | Company-code level customer settings |
+| `CustomerSalesArea` | `CustomerSalesArea_Key` | `customer_sales_area_assignments` | Sales-org level customer settings |
+| `Product` | `Product` | `products` | Material/product master |
+| `ProductDescription` | `ProductDescription_Key` | `product_descriptions` | Language-specific product text |
+| `ProductPlant` | `ProductPlant_Key` | `product_plants` | Plant-level product settings |
+| `ProductStorageLocation` | `ProductStorageLocation_Key` | `product_storage_locations` | Storage location within a plant |
+| `Plant` | `Plant` | `plants` | Physical warehouse/production facility |
+
+### 7.2 Relationships
+(SalesOrder) -[:HAS_ITEM]-> (SalesOrderItem)
+(SalesOrderItem) -[:HAS_SCHEDULE]-> (SalesOrderScheduleLine)
+(SalesOrder) -[:SOLD_TO]-> (BusinessPartner)
+(SalesOrderItem) -[:FOR_PRODUCT]-> (Product)
+(OutboundDelivery) -[:FULFILLS]-> (SalesOrder)
+(OutboundDeliveryItem)-[:PART_OF_DELIVERY]-> (OutboundDelivery)
+(BillingDocument) -[:BILLS]-> (SalesOrder)
+(BillingDocumentItem) -[:PART_OF_BILLING]-> (BillingDocument)
+(BillingCancellation) -[:CANCELS]-> (BillingDocument)
+(JournalEntry) -[:RECORDS]-> (BillingDocument)
+(Payment) -[:SETTLES]-> (BillingDocument)
+(BusinessPartner) -[:HAS_ADDRESS]-> (BusinessPartnerAddress)
+(BusinessPartner) -[:HAS_COMPANY_DATA]-> (CustomerCompany)
+(BusinessPartner) -[:HAS_SALES_AREA]-> (CustomerSalesArea)
+(Product) -[:HAS_DESCRIPTION]-> (ProductDescription)
+(Product) -[:STORED_AT]-> (ProductPlant)
+(ProductPlant) -[:HAS_STORAGE]-> (ProductStorageLocation)
+(ProductPlant) -[:IN_PLANT]-> (Plant)
+
+text
+
+---
+
+## 8. LLM Integration
+
+### 8.1 How Natural Language Becomes a Cypher Query
+Step 1 — User types:
+"91150187 - Find the journal entry number linked to this?"
+
+Step 2 — check_message_safety() passes (contains "journal", "entry")
+
+Step 3 — GPT-4o call with CYPHER_GENERATION_PROMPT:
+Input: question + full schema description
+Output: {
+"cypher": "MATCH (j:JournalEntry)-[:RECORDS]->(b:BillingDocument
+{BillingDocument: '91150187'}) RETURN j.AccountingDocument",
+"explanation": "Finds journal entries that record billing document 91150187"
+}
+
+Step 4 — validate_cypher_query() passes (read-only MATCH)
+sanitize_cypher_limit() adds LIMIT 500
+
+Step 5 — run_query() executes against Neo4j
+Returns: [{"j.AccountingDocument": "9400635958"}]
+
+Step 6 — GPT-4o call with ANSWER_GENERATION_PROMPT:
+Input: original question + cypher + results (first 20 rows)
+Output: "The journal entry number linked to billing document
+91150187 is 9400635958."
+
+Step 7 — _extract_highlight_ids() scans results for node properties,
+matches them against graphData.nodes in the browser,
+sets highlighted node IDs (amber glow in D3)
+
+Step 8 — Response returned:
+{answer, cypher, results, highlights}
+
+text
+
+### 8.2 Guardrails System
+
+Three independent layers run in sequence:
+Message received
+│
+▼
+┌─────────────────────────────────────────────┐
+│ Layer 1: check_message_safety() │
+│ • Regex: blocks passwords, keys, PII │
+│ • Regex: blocks jailbreak phrases │
+│ • Keyword: requires O2C relevance │
+│ • Returns early with redirect if unsafe │
+└──────────────────┬──────────────────────────┘
+│ safe
+▼
+┌─────────────────────────────────────────────┐
+│ LLM generates Cypher │
+└──────────────────┬──────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────┐
+│ Layer 2: validate_cypher_query() │
+│ • Blocks DELETE, DROP, CREATE USER etc. │
+│ • Requires MATCH/RETURN to be present │
+└──────────────────┬──────────────────────────┘
+│ safe
+▼
+┌─────────────────────────────────────────────┐
+│ Layer 3: sanitize_cypher_limit() │
+│ • Appends LIMIT 500 if not present │
+│ • Prevents full table scans │
+└──────────────────┬──────────────────────────┘
+│
+▼
+Execute
+
+text
+
+### 8.3 Session Memory
+
+Each browser session gets a UUID. The corresponding `GraphAgent` keeps the
+last 6 messages (3 user + 3 assistant) in `conversation_history`. These are
+injected into every LLM call so the agent can answer follow-up questions like
+"What about the delivery for that order?" without the user needing to repeat
+context.
+
+---
+
+## 9. Data Ingestion Pipeline
+data/sap-o2c-data/
+└── billing_document_headers/
+└── *.csv (or *.parquet)
+│
+▼ data_loader.py
+│ pd.read_csv / pd.read_parquet
+│ pd.concat (multiple part-files)
+│ clean NaN → None
+▼
+list[dict]
+│
+▼ graph_builder.py
+│ UNWIND $batch AS row
+│ MERGE (n:BillingDocument {BillingDocument: row.BillingDocument})
+│ SET n += row
+│ (batches of 500)
+▼
+Neo4j nodes created/updated
+│
+▼ relationship wiring
+│ MATCH both endpoints by key
+│ MERGE edge
+▼
+Neo4j edges created
+
+text
+
+The pipeline is **idempotent** — running it twice does not duplicate data.
+`MERGE` finds the existing node by its key property and updates it in place.
+
+---
+
+## 10. API Reference
+
+Full interactive docs available at `http://localhost:8000/docs` when the
+backend is running.
+
+### Graph Endpoints
+GET /api/graph/overview?limit=300&node_types=SalesOrder,BillingDocument
+GET /api/graph/node/{node_id}
+GET /api/graph/search?q=91150187&label=BillingDocument&limit=20
+GET /api/graph/stats
+
+text
+
+### Chat Endpoints
+POST /api/chat/message body: {message, session_id}
+DELETE /api/chat/session/{id}
+GET /api/chat/history/{id}
+
+text
+
+### Ingestion Endpoints
+POST /api/ingestion/start
+GET /api/ingestion/status
+POST /api/ingestion/reset
+
+text
+
+### Utility
+GET /health
+GET /api/folders
+
+text
+
+---
+
+## 11. Environment Variables
+
+Create `backend/.env`:
+
+```env
+# Neo4j connection
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
+
+# OpenAI
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_MODEL=gpt-4o
+
+# Data
+DATA_DIR=./data/sap-o2c-data
+
+# CORS (JSON array of allowed origins)
+CORS_ORIGINS=["http://localhost:3000"]
+Create frontend/.env:
+
+env
+REACT_APP_API_URL=http://localhost:8000
+12. Running Locally
+12.1 Prerequisites
+Python 3.11+
+Node.js 20+
+Docker (for Neo4j, or install Neo4j Desktop)
+12.2 Neo4j
+bash
+docker run -d \
+  --name neo4j \
+  -p 7474:7474 \
+  -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/password \
+  -e NEO4J_PLUGINS='["apoc"]' \
+  neo4j:5.19-community
+Wait ~20 seconds then open http://localhost:7474 to verify.
+
+12.3 Backend
+bash
+cd backend
+
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate       # Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env — set your OPENAI_API_KEY at minimum
+
+# Start server
+uvicorn main:app --reload --port 8000
+Verify: curl http://localhost:8000/health
+
+12.4 Frontend
+bash
+cd frontend
+
+# Install dependencies
+npm install --legacy-peer-deps
+
+# Configure environment
+echo "REACT_APP_API_URL=http://localhost:8000" > .env
+
+# Start dev server
+npm start
+Open http://localhost:3000
+
+13. Running with Docker Compose
+bash
+# 1. Add your OpenAI key to backend/.env
+echo "OPENAI_API_KEY=sk-your-key" >> backend/.env
+
+# 2. Place CSV data
+# Copy your 19 SAP folders into data/sap-o2c-data/
+
+# 3. Build and start all services
+docker-compose up --build
+
+# Services:
+#   UI          → http://localhost:3000
+#   API         → http://localhost:8000
+#   API docs    → http://localhost:8000/docs
+#   Neo4j UI    → http://localhost:7474
+bash
+# Stop everything
+docker-compose down
+
+# Stop and wipe volumes (deletes graph data)
+docker-compose down -v
+14. Placing Your Data
+text
+data/
+└── sap-o2c-data/
+    ├── billing_document_cancellations/   ← CSV or Parquet files here
+    ├── billing_document_headers/
+    ├── billing_document_items/
+    ├── business_partner_addresses/
+    ├── business_partners/
+    ├── customer_company_assignments/
+    ├── customer_sales_area_assignments/
+    ├── journal_entry_items_accounts_receivable/
+    ├── outbound_delivery_headers/
+    ├── outbound_delivery_items/
+    ├── payments_accounts_receivable/
+    ├── plants/
+    ├── product_descriptions/
+    ├── product_plants/
+    ├── product_storage_locations/
+    ├── products/
+    ├── sales_order_headers/
+    ├── sales_order_items/
+    └── sales_order_schedule_lines/
+Each folder can contain one or more .csv or .parquet files.
+The loader will concatenate multiple part-files automatically.
+
+Then trigger ingestion:
+
+bash
+curl -X POST http://localhost:8000/api/ingestion/start
+# monitor
+curl http://localhost:8000/api/ingestion/status
+Or click ⚡ Ingest to Graph in the Data Browser UI.
+
+15. How the Graph Visualisation Works
+text
+API returns {nodes[], edges[]}
+          │
+          ▼
+GraphViewer.jsx receives graphData prop
+          │
+          ▼
+buildGraph() (useCallback, memoised)
+  │
+  ├─ Filter nodes by activeFilters (chip toggles)
+  ├─ Filter edges whose both endpoints are visible
+  ├─ d3.forceSimulation(nodes)
+  │    ├─ forceLink(edges) — tension between connected nodes
+  │    ├─ forceManyBody    — global repulsion
+  │    ├─ forceCenter      — gravitational pull to centre
+  │    └─ forceCollide     — prevents overlapping
+  │
+  ├─ SVG <line> elements for edges (updated every tick)
+  ├─ SVG <g><circle><text> for nodes (updated every tick)
+  │
+  ├─ d3.zoom → pan and zoom the <g> group transform
+  ├─ d3.drag → pin/release individual nodes
+  │
+  └─ sim.on("end") → fit-to-bounds zoom transition
+
+highlightedIds changes (from chat agent)
+  │
+  └─ useEffect: update circle stroke, radius, text labels
+     WITHOUT rebuilding the simulation
+Node colours are deterministic per label type (defined in LABEL_COLORS).
+Node sizes are 8px for primary documents, 6px for secondary, 4px for
+detail nodes. Edges are semi-transparent blue with arrowheads.
+
+16. Evaluation Criteria Map
+Criterion	Where it is implemented
+Code quality and architecture	Separation of concerns: api/, llm/, ingestion/, database/ are independent modules. Pydantic models on all boundaries. Async throughout. Single-responsibility functions.
+Graph modelling	database/schema.py defines 19 node labels and 18 relationship types that faithfully represent real SAP O2C document flows. Compound keys for child entities. Indexes on all primary identifiers.
+Database / storage choice	Neo4j chosen because O2C is fundamentally a graph: documents reference other documents across process steps. Graph traversal (e.g. "trace this billing doc back to its sales order") is a single Cypher path query vs. 5 SQL joins.
+LLM integration and prompting	Three-prompt pipeline: schema-aware Cypher generation → safe execution → NL answer synthesis. Auto-fix retry on query error. Conversation history for follow-ups. Schema description injected verbatim so GPT-4o never guesses field names.
+Guardrails	Three independent layers: message safety (regex + keyword), Cypher validation (dangerous operation blocking), automatic LIMIT injection. Off-topic messages are caught before any LLM call is made.
+17. Troubleshooting
+Neo4j connection refused
+bash
+# Check Neo4j is running
+docker ps | grep neo4j
+# Check bolt port
+nc -zv localhost 7687
+# View Neo4j logs
+docker logs neo4j
+"Ingestion already running"
+The background task is still active. Poll /api/ingestion/status until
+status is completed or error, then you can restart.
+
+OpenAI API errors
+Verify OPENAI_API_KEY in backend/.env.
+Check you have GPT-4o access on your account.
+The agent automatically retries 3 times with exponential back-off for
+transient errors.
+Graph shows no nodes
+Check ingestion completed: GET /api/ingestion/status
+Verify data files exist in data/sap-o2c-data/
+Check Neo4j browser at http://localhost:7474:
+MATCH (n) RETURN count(n) should return > 0
+Frontend shows CORS error
+Ensure CORS_ORIGINS in backend/.env includes your frontend URL exactly:
+
+env
+CORS_ORIGINS=["http://localhost:3000"]
+D3 graph is empty but nodes loaded
+Check browser console for errors. Most common cause: node id values are
+returned as numbers from Neo4j but D3 forceLink expects string IDs. The
+fetchGraphOverview response maps all IDs to strings before returning.
+
+18. Extending the System
+Add a new SAP entity
+Add a loader function in ingestion/graph_builder.py.
+Add the label and key to database/schema.py (SCHEMA_INDEXES and
+SCHEMA_DESCRIPTION).
+Add the colour to LABEL_COLORS in GraphViewer.jsx.
+Call the loader in run_full_ingestion().
+Change the LLM model
+Set OPENAI_MODEL=gpt-4-turbo (or any chat completion model) in .env.
+The agent passes it directly to the OpenAI client.
+
+Add streaming chat responses
+Replace the sendChatMessage Axios POST with a fetch call consuming
+text/event-stream. On the backend, replace return ChatResponse(...) with
+a StreamingResponse using openai.chat.completions.create(stream=True).
+
+Connect to a different graph database
+Replace database/neo4j_client.py with a client for ArangoDB, Amazon Neptune,
+or any database that speaks Cypher or Gremlin. Update schema.py with the
+new query dialect.
+
+Export graph as image
+Add a button in GraphViewer.jsx that calls:
+
+javascript
+const svgEl = svgRef.current;
+const serializer = new XMLSerializer();
+const svgStr = serializer.serializeToString(svgEl);
+const blob = new Blob([svgStr], {type: "image/svg+xml"});
+const url = URL.createObjectURL(blob);
+const a = document.createElement("a");
+a.href = url; a.download = "graph.svg"; a.click();
