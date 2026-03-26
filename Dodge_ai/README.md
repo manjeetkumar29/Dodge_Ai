@@ -13,6 +13,10 @@
   <h3>Contextual Agent Queries</h3>
   <img src="assets/4_light_query.png" width="48%" alt="Light Mode Query" />
   <img src="assets/3_dark_query.png" width="48%" alt="Dark Mode Query" />
+  
+  <h3>Graph Process Analysis</h3>
+  <img src="assets/5_light_process_view.png" width="48%" alt="Light Mode Process Analysis" />
+  <img src="assets/6_dark_process_view.png" width="48%" alt="Dark Mode Process Analysis" />
 </div>
 
 ## 🧠 About the Project
